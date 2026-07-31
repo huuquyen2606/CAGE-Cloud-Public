@@ -163,8 +163,8 @@ attack surfaces (exposed metadata, leaked credentials, misconfigured storage,
 vulnerable services, …). Each lab embeds a unique secret token
 `FLAG{<cve-id>_pwned}` reachable only upon successful end-to-end exploitation of
 that CVE. `testbed/flag_oracle.py` verifies a capture by an exact string match of
-the token in the raw command output — a deterministic, CVE-specific,
-non-fakeable proof of exploitation that does not rely on the agent's self-report.
+the token in the raw command output — a deterministic, CVE-specific check of
+successful exploitation.
 
 ---
 
@@ -175,15 +175,13 @@ round count, LLM call count, token consumption and flag-capture events.
 
 | Metric | Meaning |
 | ------ | ------- |
-| **ECR** (End-to-end Completion Rate) | fraction of scenarios reaching `VULN_FOUND` (at least one vulnerability **detected**) |
-| **FCR** (Flag-Capture Rate) | of the `VULN_FOUND` runs, the proportion that additionally **capture the flag** (actually complete the exploit) |
+| **ECR** (End-to-end Completion Rate) | fraction of scenarios reaching `VULN_FOUND` |
+| **FCR** (Flag-Capture Rate) | of the `VULN_FOUND` runs, the proportion that additionally **capture the scenario flag** |
 | **Req@T / Req@S** | mean LLM calls per scenario / per success |
 | **Tok@T / Tok@S** | mean tokens per scenario / per success |
 | **SPM** | successes per million tokens (scale-invariant efficiency) |
 
-**ECR measures *detection*; FCR measures *actual exploitation*.** They are
-reported separately because a vulnerability can be flagged without the objective
-being completed. On the 86-CVE testbed across six backbones, CAGE-Cloud attains a
+On the 86-CVE testbed across six backbones, CAGE-Cloud attains a
 mean ECR of ~60% (vs ~25% and ~11% for the PentestAgent- and VulnBot-style
 baselines) and is the only architecture with a non-zero FCR (~17%); both
 baselines record a 0% flag-capture rate under matched conditions.

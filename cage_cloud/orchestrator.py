@@ -582,8 +582,6 @@ class RealExecutor:
             if "--subscription" not in command:
                 command += f" --subscription {shlex.quote(self.azure_subscription)}"
 
-        # No command blocking — pentest pipeline needs full access
-
         try:
             env = os.environ.copy()
             env.update(self.cloud_env)
@@ -2950,8 +2948,7 @@ class AIDrivenPipeline:
             logger.info(f"     ❌ Credential extraction failed: {cred_result.get('stderr', '')[:100]}")
 
     def _run_auto_aws_commands(self, task_name: str, task_phase: str, round_num: int):
-        """Run automatic AWS commands using extracted credentials.
-        Bypasses LLM entirely — directly constructs and executes the right commands."""
+        """Run deterministic AWS enumeration commands using extracted credentials."""
         creds = self.state.get("credentials_found", {})
         ak = creds.get("AWS_ACCESS_KEY_ID", "")
         sk = creds.get("AWS_SECRET_ACCESS_KEY", "")

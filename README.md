@@ -1,6 +1,6 @@
 # CAGE-Cloud
 
-**A Cloud-native Agentic Graph and Evidence-guided Framework for Autonomous Penetration Testing**
+**Structured-State and Evidence-Grounded Autonomous Penetration Testing for Cloud Environments**
 
 CAGE-Cloud is an autonomous cloud penetration-testing framework that separates
 *language-model reasoning* from *deterministic execution-state handling*. Instead
@@ -42,17 +42,7 @@ and the metrics tooling — i.e. the code accompanying the paper.
 
 CAGE-Cloud is organised as a runner-state-driven loop over six components:
 
-```
- target
-   │
-   ▼
-Skill Router ──► Planner ──► Generator ──► Executor ──► Cloud-native Extractor
- (deterministic) (LLM)       (LLM)         (subprocess)  (provider-aware parse)
-   ▲                                                          │
-   │                                                          ▼
-Graph Manager ◄──────────────── Evidence Verifier ◄───────────┘
- (typed evidence graph Gt)      (rule-based, 17 objective types)
-```
+![CAGE-Cloud high-level runtime flow](docs/figures/architecture.png)
 
 At each round `t` the runner reconstructs a bounded, typed **graph summary** from
 the current state, the **Skill Router** selects a skill family plus few-shot

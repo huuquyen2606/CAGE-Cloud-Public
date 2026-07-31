@@ -1,0 +1,685 @@
+[
+  {
+    "id": "fs-web-recon-aws-01",
+    "skill": "web_recon_bootstrap",
+    "provider": "aws",
+    "stack": "spring-boot",
+    "input_state": {
+      "phase": "recon",
+      "target_url": "https://example-lab.local",
+      "web_endpoints": [],
+      "credentials_found": {},
+      "services_detected": []
+    },
+    "output": {
+      "tasks": [
+        {
+          "id": 1,
+          "name": "Web surface reconnaissance",
+          "instruction": "Enumerate actuator/common endpoints on target URL and record reachable paths and response signatures.",
+          "phase": "recon",
+          "target_service": "web",
+          "cve_id": null
+        },
+        {
+          "id": 2,
+          "name": "Detect SSRF/proxy entry points",
+          "instruction": "Identify proxy-like endpoints and test controlled internal URL fetch behavior in authorized scope.",
+          "phase": "recon",
+          "target_service": "web-proxy",
+          "cve_id": null
+        }
+      ],
+      "reasoning": "No endpoints discovered yet; prioritize web recon and actuator enumeration before exploit attempts."
+    }
+  },
+  {
+    "id": "fs-web-recon-generic-02",
+    "skill": "web_recon_bootstrap",
+    "provider": "any",
+    "stack": "nginx",
+    "input_state": {
+      "phase": "recon",
+      "target_url": "https://api.example.com",
+      "web_endpoints": [],
+      "credentials_found": {},
+      "services_detected": [
+        "nginx"
+      ]
+    },
+    "output": {
+      "tasks": [
+        {
+          "id": 1,
+          "name": "Standard HTTP/HTTPS enumeration",
+          "instruction": "Perform comprehensive path enumeration using common dictionaries and collect status codes, headers, and response sizes.",
+          "phase": "recon",
+          "target_service": "web",
+          "cve_id": null
+        },
+        {
+          "id": 2,
+          "name": "Identify security misconfigurations",
+          "instruction": "Check for exposed configs, backup files, debug endpoints, and other common web misconfigurations.",
+          "phase": "recon",
+          "target_service": "web",
+          "cve_id": null
+        }
+      ],
+      "reasoning": "Initial surface recon required; establish baseline of reachable endpoints before vulnerability analysis."
+    }
+  },
+  {
+    "id": "fs-ssrf-imds-aws-01",
+    "skill": "ssrf_to_metadata",
+    "provider": "aws",
+    "stack": "spring-boot",
+    "input_state": {
+      "phase": "recon",
+      "web_endpoints": [
+        "/proxy",
+        "/fetch"
+      ],
+      "credentials_found": {},
+      "services_detected": [
+        "spring-boot"
+      ],
+      "web_findings": {
+        "has_set_cookie": false,
+        "proxy_confirmed": true
+      }
+    },
+    "output": {
+      "tasks": [
+        {
+          "id": 1,
+          "name": "Validate SSRF path to metadata",
+          "instruction": "Validate IMDSv2 flow via proxy endpoint (token request then metadata calls) and capture evidence.",
+          "phase": "enum",
+          "target_service": "ec2-metadata",
+          "cve_id": null
+        },
+        {
+          "id": 2,
+          "name": "Extract temporary cloud credentials",
+          "instruction": "If metadata access is confirmed, enumerate role name and retrieve temporary credentials in-scope.",
+          "phase": "enum",
+          "target_service": "iam",
+          "cve_id": null
+        }
+      ],
+      "reasoning": "Proxy surface detected; chain SSRF->metadata->credential extraction to elevate access."
+    }
+  },
+  {
+    "id": "fs-auth-bypass-session-01-r",
+    "skill": "cve_validation",
+    "provider": "any",
+    "stack": "generic",
+    "input_state": {
+      "phase": "recon",
+      "web_endpoints": [
+        "/login",
+        "/auth"
+      ],
+      "credentials_found": {},
+      "web_findings": {
+        "has_set_cookie": true,
+        "login_form_detected": true
+      },
+      "services_detected": []
+    },
+    "output": {
+      "tasks": [
+        {
+          "id": 1,
+          "name": "Analyze authentication mechanism",
+          "instruction": "Reverse-engineer login flow, identify auth tokens, check for default credentials, and look for auth bypass techniques.",
+          "phase": "enum",
+          "target_service": "auth",
+          "cve_id": null
+        },
+        {
+          "id": 2,
+          "name": "Attempt auth bypass or session acquisition",
+          "instruction": "Try common auth bypass patterns (SQL injection, JWT manipulation, default creds) or acquire valid session through authorized testing.",
+          "phase": "enum",
+          "target_service": "auth",
+          "cve_id": null
+        }
+      ],
+      "reasoning": "Authentication workflow confirmed; prioritize obtaining valid session/credentials for deeper access."
+    }
+  },
+  {
+    "id": "fs-cloud-enum-after-creds-aws-01",
+    "skill": "cloud_enum_after_creds",
+    "provider": "aws",
+    "stack": "generic",
+    "input_state": {
+      "phase": "enum",
+      "credentials_found": {
+        "AWS_ACCESS_KEY_ID": "***",
+        "AWS_SECRET_ACCESS_KEY": "***"
+      },
+      "services_detected": []
+    },
+    "output": {
+      "tasks": [
+        {
+          "id": 1,
+          "name": "Enumerate identity and permissions",
+          "instruction": "Use extracted credentials to identify principal and enumerate effective IAM permissions via sts:GetCallerIdentity and iam:GetUser.",
+          "phase": "enum",
+          "target_service": "aws-iam",
+          "cve_id": null
+        },
+        {
+          "id": 2,
+          "name": "Enumerate sensitive storage/resources",
+          "instruction": "Enumerate accessible S3 buckets, Secrets Manager entries, RDS instances, and record high-risk exposures.",
+          "phase": "enum",
+          "target_service": "s3,secretsmanager,rds",
+          "cve_id": null
+        }
+      ],
+      "reasoning": "AWS credentials acquired; pivot to cloud enumeration for privilege escalation and lateral movement."
+    }
+  },
+  {
+    "id": "fs-cloud-enum-after-creds-azure-02",
+    "skill": "cloud_enum_after_creds",
+    "provider": "azure",
+    "stack": "generic",
+    "input_state": {
+      "phase": "enum",
+      "credentials_found": {
+        "AZURE_SUBSCRIPTION_ID": "***",
+        "AZURE_TENANT_ID": "***",
+        "AZURE_CLIENT_ID": "***"
+      },
+      "services_detected": [
+        "azure-keyvault"
+      ]
+    },
+    "output": {
+      "tasks": [
+        {
+          "id": 1,
+          "name": "Enumerate Azure role assignments",
+          "instruction": "Use credentials to enumerate role assignments and RBAC permissions across subscription and resource groups.",
+          "phase": "enum",
+          "target_service": "azure-rbac",
+          "cve_id": null
+        },
+        {
+          "id": 2,
+          "name": "Extract secrets from Key Vault",
+          "instruction": "Attempt to enumerate and extract secrets from accessible Azure Key Vault instances.",
+          "phase": "enum",
+          "target_service": "azure-keyvault",
+          "cve_id": null
+        }
+      ],
+      "reasoning": "Azure service credentials acquired; enumerate RBAC and Key Vault for secrets and privilege escalation."
+    }
+  },
+  {
+    "id": "fs-version-cve-validation-gitlab-01-r",
+    "skill": "cve_validation",
+    "provider": "any",
+    "stack": "gitlab",
+    "input_state": {
+      "phase": "enum",
+      "cve_candidates": [
+        "CVE-2021-22205"
+      ],
+      "services_detected": [
+        "gitlab"
+      ],
+      "web_endpoints": [
+        "/api/v4"
+      ],
+      "version_candidates": [
+        "GitLab 13.10.1"
+      ]
+    },
+    "output": {
+      "tasks": [
+        {
+          "id": 1,
+          "name": "Validate GitLab version and preconditions",
+          "instruction": "Confirm GitLab version via /api/v4/version endpoint and verify affected version range for CVE-2021-22205.",
+          "phase": "enum",
+          "target_service": "gitlab",
+          "cve_id": "CVE-2021-22205"
+        },
+        {
+          "id": 2,
+          "name": "Check exploit preconditions",
+          "instruction": "Verify that file upload functionality is reachable and avatar processing is enabled (required for this CVE).",
+          "phase": "enum",
+          "target_service": "gitlab",
+          "cve_id": "CVE-2021-22205"
+        }
+      ],
+      "reasoning": "CVE candidate identified; validate version certainty and preconditions before attempting exploit."
+    }
+  },
+  {
+    "id": "fs-safe-exploit-validation-01-r",
+    "skill": "cve_validation",
+    "provider": "any",
+    "stack": "gitlab",
+    "input_state": {
+      "phase": "exploit",
+      "cve_candidates": [
+        "CVE-2021-22205"
+      ],
+      "version_confirmed": "GitLab 13.10.1",
+      "preconditions_verified": {
+        "file_upload_available": true,
+        "avatar_processing_enabled": true
+      },
+      "web_endpoints": [
+        "/api/v4/projects",
+        "/uploads"
+      ]
+    },
+    "output": {
+      "tasks": [
+        {
+          "id": 1,
+          "name": "Run safe PoC validator for CVE-2021-22205",
+          "instruction": "Execute authorized non-destructive PoC that validates command execution capability without causing damage (e.g., sleep command with time measurement).",
+          "phase": "exploit",
+          "target_service": "gitlab",
+          "cve_id": "CVE-2021-22205"
+        },
+        {
+          "id": 2,
+          "name": "Capture proof-of-effect evidence",
+          "instruction": "Document successful command execution with timestamps and output, establishing definitive proof of vulnerability.",
+          "phase": "exploit",
+          "target_service": "gitlab",
+          "cve_id": "CVE-2021-22205"
+        }
+      ],
+      "reasoning": "All preconditions validated; proceed with authorized PoC to establish proof-of-concept."
+    }
+  },
+  {
+    "id": "fs-post-exploit-pivot-01-r",
+    "skill": "cloud_enum_after_creds",
+    "provider": "aws",
+    "stack": "spring-boot",
+    "input_state": {
+      "phase": "post",
+      "exploits_successful": [
+        "CVE-2021-22205"
+      ],
+      "credentials_found": {
+        "APP_DB_PASSWORD": "***",
+        "AWS_ACCESS_KEY": "***"
+      },
+      "internal_services_discovered": []
+    },
+    "output": {
+      "tasks": [
+        {
+          "id": 1,
+          "name": "Enumerate internal network and services",
+          "instruction": "From compromised host, scan internal network ranges (RFC 1918) to identify additional services, databases, and cloud metadata endpoints.",
+          "phase": "post",
+          "target_service": "network-scan",
+          "cve_id": null
+        },
+        {
+          "id": 2,
+          "name": "Attempt lateral movement and privilege escalation",
+          "instruction": "Use extracted credentials to pivot to accessible internal services (databases, cloud APIs, internal web apps) and escalate privileges where possible.",
+          "phase": "post",
+          "target_service": "lateral-movement",
+          "cve_id": null
+        }
+      ],
+      "reasoning": "Exploit successful; pivot to internal reconnaissance and lateral movement for deeper access."
+    }
+  },
+  {
+    "id": "fs-replan-after-failure-01-r",
+    "skill": "replan_after_fail",
+    "provider": "any",
+    "stack": "generic",
+    "input_state": {
+      "phase": "exploit",
+      "exploits_failed": [
+        "CVE-2021-22205 attempt failed",
+        "SSRF to metadata failed"
+      ],
+      "exploits_successful": [],
+      "failure_history": [
+        {
+          "type": "version_mismatch",
+          "cve": "CVE-2021-22205",
+          "reason": "Target version is 13.11, not in affected range"
+        },
+        {
+          "type": "precondition_missing",
+          "target": "SSRF",
+          "reason": "Proxy endpoint requires authentication which was not acquired"
+        }
+      ]
+    },
+    "output": {
+      "tasks": [
+        {
+          "id": 1,
+          "name": "Diagnose exploit failure preconditions",
+          "instruction": "Analyze failed attempts and identify root causes: wrong version range, missing auth, unreachable path, or unmet technical preconditions.",
+          "phase": "enum",
+          "target_service": "analysis",
+          "cve_id": null
+        },
+        {
+          "id": 2,
+          "name": "Collect missing evidence before retry",
+          "instruction": "Run low-cost validators to confirm missing preconditions (correct version, required auth, reachable service). Only retry after evidence confirms applicability.",
+          "phase": "enum",
+          "target_service": "validator",
+          "cve_id": null
+        }
+      ],
+      "reasoning": "Multiple exploits failed due to unmet preconditions; diagnose root causes and gather missing evidence before retry attempts."
+    }
+  },
+  {
+    "id": "fs-replan-after-failure-02-r",
+    "skill": "replan_after_fail",
+    "provider": "gcp",
+    "stack": "kubernetes",
+    "input_state": {
+      "phase": "enum",
+      "exploits_failed": [
+        "K8s node enumeration blocked",
+        "Service account escalation failed"
+      ],
+      "web_endpoints": [
+        "/api"
+      ],
+      "credentials_found": {
+        "k8s_service_account_token": "***"
+      },
+      "failure_history": [
+        {
+          "type": "insufficient_permissions",
+          "action": "enumerate_nodes",
+          "reason": "Service account lacks nodes/list permission"
+        }
+      ]
+    },
+    "output": {
+      "tasks": [
+        {
+          "id": 1,
+          "name": "Re-enumerate service account RBAC",
+          "instruction": "Query actual RBAC permissions granted to current service account via auth/can-i and identify exploitable paths within granted permissions.",
+          "phase": "enum",
+          "target_service": "k8s-rbac",
+          "cve_id": null
+        },
+        {
+          "id": 2,
+          "name": "Pivot via permitted resources",
+          "instruction": "Focus enumeration on resources where RBAC permits access (e.g., secrets, configmaps, pods in specific namespaces).",
+          "phase": "enum",
+          "target_service": "k8s",
+          "cve_id": null
+        }
+      ],
+      "reasoning": "Initial approach failed due to insufficient RBAC; replan to exploit permitted resources instead."
+    }
+  },
+  {
+    "id": "fs-general-recon-any-01",
+    "skill": "web_recon_bootstrap",
+    "provider": "any",
+    "stack": "generic",
+    "input_state": {
+      "phase": "recon",
+      "target_url": "https://internal.example.local",
+      "services_detected": [],
+      "web_endpoints": [],
+      "findings": []
+    },
+    "output": {
+      "tasks": [
+        {
+          "id": 1,
+          "name": "Baseline service discovery",
+          "instruction": "Perform lightweight in-scope service discovery and identify externally reachable assets, open ports, and running services.",
+          "phase": "recon",
+          "target_service": "network",
+          "cve_id": null
+        },
+        {
+          "id": 2,
+          "name": "Collect stack fingerprints",
+          "instruction": "Collect app/cloud stack fingerprints from headers, response content, and error messages; map initial attack surface.",
+          "phase": "recon",
+          "target_service": "web,cloud",
+          "cve_id": null
+        }
+      ],
+      "reasoning": "No strong prior signal; establish baseline attack surface and technology fingerprints first."
+    }
+  },
+  {
+    "id": "fs-general-recon-aws-01",
+    "skill": "general_recon",
+    "provider": "aws",
+    "stack": "generic",
+    "input_state": {
+      "phase": "recon",
+      "target_url": "https://target.example.com",
+      "web_endpoints": [],
+      "credentials_found": {},
+      "cve_candidates": [],
+      "services_detected": []
+    },
+    "output": {
+      "tasks": [
+        {
+          "id": 1,
+          "name": "Cloud service discovery",
+          "instruction": "Identify exposed AWS services (S3, ECR, Cognito, Lambda, API Gateway) via DNS, HTTP headers, and well-known endpoints.",
+          "phase": "recon",
+          "target_service": "aws-generic",
+          "cve_id": null
+        },
+        {
+          "id": 2,
+          "name": "Probe IMDS and metadata exposure",
+          "instruction": "Test for indirect access to AWS instance metadata via SSRF, proxy endpoints, or server-side fetch features.",
+          "phase": "recon",
+          "target_service": "aws-metadata",
+          "cve_id": null
+        }
+      ],
+      "reasoning": "Initial reconnaissance with no prior information; start with broad cloud service discovery before targeting specific vulnerabilities."
+    }
+  },
+  {
+    "id": "fs-general-recon-azure-01",
+    "skill": "general_recon",
+    "provider": "azure",
+    "stack": "generic",
+    "input_state": {
+      "phase": "recon",
+      "target_url": "https://target.azurewebsites.net",
+      "web_endpoints": [],
+      "credentials_found": {},
+      "cve_candidates": [],
+      "services_detected": []
+    },
+    "output": {
+      "tasks": [
+        {
+          "id": 1,
+          "name": "Azure service enumeration",
+          "instruction": "Identify Azure-hosted services from URL patterns (azurewebsites, blob.core.windows.net, vault.azure.net) and certificate metadata.",
+          "phase": "recon",
+          "target_service": "azure-generic",
+          "cve_id": null
+        },
+        {
+          "id": 2,
+          "name": "Probe Azure IMDS surfaces",
+          "instruction": "Look for SSRF surfaces that allow reaching 169.254.169.254/metadata/identity/oauth2/token for managed identity tokens.",
+          "phase": "recon",
+          "target_service": "azure-metadata",
+          "cve_id": null
+        }
+      ],
+      "reasoning": "Azure target detected; prioritize Azure-specific recon patterns and managed identity discovery."
+    }
+  },
+  {
+    "id": "fs-general-recon-gcp-01",
+    "skill": "general_recon",
+    "provider": "gcp",
+    "stack": "generic",
+    "input_state": {
+      "phase": "recon",
+      "target_url": "https://target.appspot.com",
+      "web_endpoints": [],
+      "credentials_found": {},
+      "cve_candidates": [],
+      "services_detected": []
+    },
+    "output": {
+      "tasks": [
+        {
+          "id": 1,
+          "name": "GCP service enumeration",
+          "instruction": "Detect GCP services from URL patterns (appspot, run.app, storage.googleapis.com, cloudfunctions.net) and HTTP headers.",
+          "phase": "recon",
+          "target_service": "gcp-generic",
+          "cve_id": null
+        },
+        {
+          "id": 2,
+          "name": "Probe GCP metadata server",
+          "instruction": "Test SSRF surfaces for access to metadata.google.internal with Metadata-Flavor: Google header to retrieve service account tokens.",
+          "phase": "recon",
+          "target_service": "gcp-metadata",
+          "cve_id": null
+        }
+      ],
+      "reasoning": "GCP target detected; enumerate GCP-native services and probe for metadata server access."
+    }
+  },
+  {
+    "id": "fs-cloud-enum-azure-01",
+    "skill": "cloud_enum_after_creds",
+    "provider": "azure",
+    "stack": "azure-sdk",
+    "input_state": {
+      "phase": "enum",
+      "credentials_found": {
+        "AZURE_CLIENT_ID": "<extracted>",
+        "AZURE_CLIENT_SECRET": "<extracted>",
+        "AZURE_TENANT_ID": "<extracted>"
+      },
+      "services_detected": [
+        "azure-storage"
+      ]
+    },
+    "output": {
+      "tasks": [
+        {
+          "id": 1,
+          "name": "Azure resource enumeration",
+          "instruction": "Login via az ad sp credentials and enumerate accessible subscriptions, resource groups, storage accounts, and key vaults.",
+          "phase": "enum",
+          "target_service": "azure-resource-manager",
+          "cve_id": null
+        },
+        {
+          "id": 2,
+          "name": "Storage account access",
+          "instruction": "List blob containers in discovered storage accounts and check public access settings.",
+          "phase": "enum",
+          "target_service": "azure-blob",
+          "cve_id": null
+        }
+      ],
+      "reasoning": "Azure SP credentials extracted; pivot to ARM enumeration and storage access."
+    }
+  },
+  {
+    "id": "fs-cve-validation-azure-01",
+    "skill": "cve_validation",
+    "provider": "azure",
+    "stack": "azure-functions",
+    "input_state": {
+      "phase": "enum",
+      "cve_candidates": [
+        "CVE-2025-30387"
+      ],
+      "services_detected": [
+        "azure-functions"
+      ],
+      "target_url": "https://target.azurewebsites.net"
+    },
+    "output": {
+      "tasks": [
+        {
+          "id": 1,
+          "name": "Validate Azure Functions CVE",
+          "instruction": "Verify the target's Azure Functions runtime version and confirm vulnerability match for CVE-2025-30387 before exploit attempt.",
+          "phase": "enum",
+          "target_service": "azure-functions",
+          "cve_id": "CVE-2025-30387"
+        }
+      ],
+      "reasoning": "CVE candidate identified for Azure Functions; validate version match before exploitation."
+    }
+  },
+  {
+    "id": "fs-cloud-enum-gcp-01",
+    "skill": "cloud_enum_after_creds",
+    "provider": "gcp",
+    "stack": "gcp-sdk",
+    "input_state": {
+      "phase": "enum",
+      "credentials_found": {
+        "GCP_SERVICE_ACCOUNT_KEY_JSON": "<extracted>"
+      },
+      "services_detected": [
+        "gcp-storage"
+      ]
+    },
+    "output": {
+      "tasks": [
+        {
+          "id": 1,
+          "name": "GCP project enumeration",
+          "instruction": "Activate service account and run gcloud projects list, gcloud iam service-accounts list, gcloud storage buckets list.",
+          "phase": "enum",
+          "target_service": "gcp-iam",
+          "cve_id": null
+        },
+        {
+          "id": 2,
+          "name": "GCS bucket enumeration",
+          "instruction": "List objects in accessible buckets and check IAM policy for public/world-readable bindings.",
+          "phase": "enum",
+          "target_service": "gcp-storage",
+          "cve_id": null
+        }
+      ],
+      "reasoning": "GCP service account key extracted; enumerate IAM, projects, and GCS buckets."
+    }
+  }
+]

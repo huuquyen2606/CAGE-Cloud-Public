@@ -190,28 +190,6 @@ baselines record a 0% flag-capture rate under matched conditions.
 
 ---
 
-## Implementation notes (scope & honesty)
-
-To keep the code and the paper aligned, the current runner behaves as follows:
-
-- **Skill Router.** The pipeline uses the six-family runner-side router in
-  `cage_cloud/skill_router.py` (`replan_after_fail`, `ssrf_to_metadata`,
-  `cloud_enum_after_creds`, `cve_validation`, `web_recon_bootstrap`,
-  `general_recon`), scored `10·skill + 4·provider + 1·any`.
-- **Evidence graph.** `cage_cloud/graph.py` defines a schema of 11 node types and
-  13 edge types; the running pipeline reconstructs a *Planner-facing snapshot*
-  from the runner state each round and populates the subset of types that appear
-  during a run. The graph is a bounded state summary, not a persistent store.
-- **Evidence Verifier.** Confidence is assigned by objective-specific heuristic
-  handlers as discrete constants (verified `0.88–0.95`, partial `0.5–0.6`,
-  unverified `0.0`); there is no continuous threshold gate or sigmoid.
-- **ScopeGuard.** `cage_cloud/scope_guard.py` provides network/command/budget
-  policy checks. In the current runner, staying within scope depends on the
-  Planner/Generator following their prompt constraints; a deterministic
-  pre-execution enforcement gate is left as future work.
-
----
-
 ## Responsible use
 
 CAGE-Cloud is designed and evaluated **exclusively within authorised, isolated,

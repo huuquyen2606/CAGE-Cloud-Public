@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Secrets / local config
+.env
+*.key
+credentials.*
+secrets.*
+
+# Run artifacts (per-CVE logs, states, benchmark outputs)
+benchmark_results_*/
+pipeline_results_*/
+*_state.json
+*_exec.json
+*_report.md
+*.log
+
+# RAG index artifacts
+*.faiss
+*.index
+rag_index/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

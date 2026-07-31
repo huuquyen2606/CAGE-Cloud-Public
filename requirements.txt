@@ -1,0 +1,13 @@
+# --- Core pipeline (Planner / Generator / Executor / Verifier / Graph) ---
+requests>=2.28
+
+# --- Optional: retrieval-augmented CVE knowledge recall (cage_cloud.rag) ---
+# Only needed if you enable the RAG module; the pipeline degrades gracefully
+# to keyword recall when these are absent.
+# numpy>=1.24
+# torch>=2.1
+# transformers>=4.40
+# faiss-cpu>=1.7
+
+# --- Optional: metrics export to spreadsheets (evaluation/) ---
+# openpyxl>=3.1

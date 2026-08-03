@@ -1,6 +1,6 @@
 # CAGE-Cloud
 
-**A Cloud-native Agentic Graph and Evidence-guided Framework for Autonomous Penetration Testing**
+**Structured-State and Evidence-Grounded Autonomous Penetration Testing for Cloud Environments**
 
 CAGE-Cloud is an autonomous cloud penetration-testing framework that separates
 *language-model reasoning* from *deterministic execution-state handling*. Instead
@@ -42,17 +42,7 @@ and the metrics tooling — i.e. the code accompanying the paper.
 
 CAGE-Cloud is organised as a runner-state-driven loop over six components:
 
-```
- target
-   │
-   ▼
-Skill Router ──► Planner ──► Generator ──► Executor ──► Cloud-native Extractor
- (deterministic) (LLM)       (LLM)         (subprocess)  (provider-aware parse)
-   ▲                                                          │
-   │                                                          ▼
-Graph Manager ◄──────────────── Evidence Verifier ◄───────────┘
- (typed evidence graph Gt)      (rule-based, 17 objective types)
-```
+![CAGE-Cloud high-level runtime flow](docs/figures/architecture.png)
 
 At each round `t` the runner reconstructs a bounded, typed **graph summary** from
 the current state, the **Skill Router** selects a skill family plus few-shot
@@ -173,8 +163,8 @@ attack surfaces (exposed metadata, leaked credentials, misconfigured storage,
 vulnerable services, …). Each lab embeds a unique secret token
 `FLAG{<cve-id>_pwned}` reachable only upon successful end-to-end exploitation of
 that CVE. `testbed/flag_oracle.py` verifies a capture by an exact string match of
-the token in the raw command output — a deterministic, CVE-specific,
-non-fakeable proof of exploitation that does not rely on the agent's self-report.
+the token in the raw command output — a deterministic, CVE-specific check of
+successful exploitation.
 
 ---
 
@@ -185,40 +175,16 @@ round count, LLM call count, token consumption and flag-capture events.
 
 | Metric | Meaning |
 | ------ | ------- |
-| **ECR** (End-to-end Completion Rate) | fraction of scenarios reaching `VULN_FOUND` (at least one vulnerability **detected**) |
-| **FCR** (Flag-Capture Rate) | of the `VULN_FOUND` runs, the proportion that additionally **capture the flag** (actually complete the exploit) |
+| **ECR** (End-to-end Completion Rate) | fraction of scenarios reaching `VULN_FOUND` |
+| **FCR** (Flag-Capture Rate) | of the `VULN_FOUND` runs, the proportion that additionally **capture the scenario flag** |
 | **Req@T / Req@S** | mean LLM calls per scenario / per success |
 | **Tok@T / Tok@S** | mean tokens per scenario / per success |
 | **SPM** | successes per million tokens (scale-invariant efficiency) |
 
-**ECR measures *detection*; FCR measures *actual exploitation*.** They are
-reported separately because a vulnerability can be flagged without the objective
-being completed. On the 86-CVE testbed across six backbones, CAGE-Cloud attains a
+On the 86-CVE testbed across six backbones, CAGE-Cloud attains a
 mean ECR of ~60% (vs ~25% and ~11% for the PentestAgent- and VulnBot-style
 baselines) and is the only architecture with a non-zero FCR (~17%); both
 baselines record a 0% flag-capture rate under matched conditions.
-
----
-
-## Implementation notes (scope & honesty)
-
-To keep the code and the paper aligned, the current runner behaves as follows:
-
-- **Skill Router.** The pipeline uses the six-family runner-side router in
-  `cage_cloud/skill_router.py` (`replan_after_fail`, `ssrf_to_metadata`,
-  `cloud_enum_after_creds`, `cve_validation`, `web_recon_bootstrap`,
-  `general_recon`), scored `10·skill + 4·provider + 1·any`.
-- **Evidence graph.** `cage_cloud/graph.py` defines a schema of 11 node types and
-  13 edge types; the running pipeline reconstructs a *Planner-facing snapshot*
-  from the runner state each round and populates the subset of types that appear
-  during a run. The graph is a bounded state summary, not a persistent store.
-- **Evidence Verifier.** Confidence is assigned by objective-specific heuristic
-  handlers as discrete constants (verified `0.88–0.95`, partial `0.5–0.6`,
-  unverified `0.0`); there is no continuous threshold gate or sigmoid.
-- **ScopeGuard.** `cage_cloud/scope_guard.py` provides network/command/budget
-  policy checks. In the current runner, staying within scope depends on the
-  Planner/Generator following their prompt constraints; a deterministic
-  pre-execution enforcement gate is left as future work.
 
 ---
 

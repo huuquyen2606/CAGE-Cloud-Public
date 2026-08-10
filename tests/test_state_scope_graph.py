@@ -103,4 +103,3 @@ def test_emit_target_event_writes_digest(tmp_path, monkeypatch):
     assert row["run_id"] == "run-1"
     assert row["flag_digest"] == event["flag_digest"]
     assert row["condition_satisfied"] is True
-

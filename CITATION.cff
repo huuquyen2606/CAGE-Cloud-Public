@@ -3,7 +3,7 @@ message: "If you use this software, please cite the preferred citation below."
 title: "CAGE-Cloud"
 type: software
 license: Apache-2.0
-repository-code: "https://github.com/TuanHung1149/CAGE-Cloud-Public"
+repository-code: "https://github.com/TuanHung1149/CAGE-Cloud-Public.git"
 authors:
   - family-names: "Nguyen Huu"
     given-names: "Quyen"

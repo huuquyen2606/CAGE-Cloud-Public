@@ -89,7 +89,7 @@ The analysis package must implement:
 - VIDR, VIY@T, ECAR, ECY@T, SDR, SY@T, CAR, and CY@T as operational telemetry;
 - mean requests per target and median token use with first/third quartiles;
 - pooled Tok@Req, Req@F, Tok@F, FPMT, and FPkR;
-- Wilson 95% intervals for per-backbone FRR;
+- 95% scenario-cluster bootstrap intervals for FRR;
 - two-sided exact McNemar tests with Holm correction; and
 - the 10,000-replicate CVE-cluster bootstrap described in the paper.
 

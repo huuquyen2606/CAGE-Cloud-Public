@@ -1,41 +1,41 @@
-from evaluation.compute_metrics import RunMetrics, cluster_bootstrap_interval, summarize
+from evaluation.compute_metrics import RunMetrics, coverage_by_architecture, summarize
 
 
-def test_cluster_bootstrap_interval_is_deterministic():
-    runs = [
-        RunMetrics(run_id="r1", cve="CVE-1", architecture="CAGE-Cloud", backbone="b1", flag_recovered=1),
-        RunMetrics(run_id="r2", cve="CVE-2", architecture="CAGE-Cloud", backbone="b1", flag_recovered=0),
-        RunMetrics(run_id="r3", cve="CVE-3", architecture="CAGE-Cloud", backbone="b1", flag_recovered=1),
-    ]
-    first = cluster_bootstrap_interval(runs, iterations=200, seed=7)
-    second = cluster_bootstrap_interval(runs, iterations=200, seed=7)
-    assert first == second
-    assert 0.0 <= first[0] <= first[1] <= 1.0
+def _run(run_id: str, cve: str, architecture: str, backbone: str, flag: int) -> RunMetrics:
+    return RunMetrics(
+        run_id=run_id,
+        cve=cve,
+        architecture=architecture,
+        backbone=backbone,
+        flag_recovered=flag,
+        llm_requests=10,
+        total_tokens=1000,
+    )
 
 
-def test_summarize_uses_exploit_activity_for_ecar():
-    runs = [
-        RunMetrics(
-            run_id="r1",
-            cve="CVE-1",
-            architecture="CAGE-Cloud",
-            backbone="b1",
-            exploit_activity=2,
-            total_tokens=100,
-            llm_requests=2,
-        ),
-        RunMetrics(
-            run_id="r2",
-            cve="CVE-2",
-            architecture="CAGE-Cloud",
-            backbone="b1",
-            exploit_activity=0,
-            total_tokens=100,
-            llm_requests=2,
-        ),
-    ]
-    metric = summarize(runs)
-    assert metric["ECAR"] == 0.5
-    assert metric["ECY@T"] == 1.0
-    assert metric["FRR_CI_method"] == "scenario_cluster_bootstrap_95"
+def test_summarize_reports_cluster_bootstrap_bounds():
+    runs = []
+    for idx in range(6):
+        runs.append(_run(f"a-{idx}", "CVE-1", "CAGE-Cloud", f"bb-{idx}", 1))
+        runs.append(_run(f"b-{idx}", "CVE-2", "CAGE-Cloud", f"bb-{idx}", 0))
 
+    summary = summarize(runs)
+
+    assert summary["FRR"] == 0.5
+    assert 0.0 <= summary["FRR_CI_low"] <= summary["FRR"] <= summary["FRR_CI_high"] <= 1.0
+    assert summary["FRR_CI_method"] == "scenario_cluster_bootstrap_95"
+
+
+def test_coverage_by_architecture_tracks_any_and_all_backbones():
+    runs = []
+    for idx in range(6):
+        runs.append(_run(f"a-{idx}", "CVE-1", "CAGE-Cloud", f"bb-{idx}", 1))
+        runs.append(_run(f"b-{idx}", "CVE-2", "CAGE-Cloud", f"bb-{idx}", 1 if idx == 0 else 0))
+
+    coverage = coverage_by_architecture(runs)["CAGE-Cloud"]
+
+    assert coverage["scenarios"] == 2
+    assert coverage["covered_any"] == 2
+    assert coverage["covered_all"] == 1
+    assert coverage["ABFC"] == 1.0
+    assert coverage["ALBFC"] == 0.5

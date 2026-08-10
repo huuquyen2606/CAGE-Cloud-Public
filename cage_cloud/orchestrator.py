@@ -42,8 +42,10 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import requests
+from cage_cloud.schema import BudgetSnapshot
 
 # RAG Integration
 try:
@@ -56,17 +58,19 @@ except Exception:
 
 # Graph state (v2 — full persistent graph with failure tracking)
 try:
-    from cage_cloud.graph import build_graph_lite_state
+    from cage_cloud.graph import build_graph_lite_state, progress_signature
     GRAPH_LITE_AVAILABLE = True
 except Exception:
     GRAPH_LITE_AVAILABLE = False
     build_graph_lite_state = None
+    progress_signature = None
 
 # Skill Router — few-shot retrieval for Planner
 try:
     from cage_cloud.skill_router import (
         route_planner_skill,
         infer_provider,
+        infer_stack,
         retrieve_planner_examples,
         format_planner_fewshot_block,
         load_planner_examples,
@@ -84,6 +88,23 @@ try:
 except Exception:
     EVIDENCE_VERIFIER_AVAILABLE = False
     verify_task_execution = None
+
+# Deterministic commit gate for authoritative state
+try:
+    from cage_cloud.state_commit import finalize_transition
+    STATE_COMMIT_AVAILABLE = True
+except Exception:
+    STATE_COMMIT_AVAILABLE = False
+    finalize_transition = None
+
+# Scope guard for executor-side enforcement
+try:
+    from cage_cloud.scope_guard import ScopeGuard, ScopePolicy
+    SCOPE_GUARD_AVAILABLE = True
+except Exception:
+    SCOPE_GUARD_AVAILABLE = False
+    ScopeGuard = None
+    ScopePolicy = None
 
 # =============================================================================
 # Logging
@@ -493,6 +514,20 @@ class RealExecutor:
     """Execute commands against REAL cloud targets. Supports AWS, Azure, GCP CLIs."""
 
     MAX_OUTPUT_BYTES = 512 * 1024  # 512 KB per stream — prevents OOM on large outputs
+    HTTP_TOOLS = ("curl", "wget", "http", "https")
+    _DYNAMIC_ENV_KEYS = {
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_DEFAULT_REGION",
+        "AZURE_CLIENT_ID",
+        "AZURE_CLIENT_SECRET",
+        "AZURE_TENANT_ID",
+        "AZURE_SUBSCRIPTION_ID",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GCP_PROJECT",
+        "GOOGLE_CLOUD_PROJECT",
+    }
 
     def __init__(
         self,
@@ -500,13 +535,19 @@ class RealExecutor:
         aws_profile: Optional[str] = None,
         gcp_project: Optional[str] = None,
         azure_subscription: Optional[str] = None,
+        scope_guard: Optional["ScopeGuard"] = None,
         timeout: int = 30,
     ):
         self.cloud_env = cloud_env or {}
+        self.base_cloud_env = dict(self.cloud_env)
         self.aws_profile = aws_profile
         self.gcp_project = gcp_project
         self.azure_subscription = azure_subscription
+        self.scope_guard = scope_guard
         self.timeout = timeout
+        self.tool_calls_used = 0
+        self.http_requests_used = 0
+        self.started_at = time.monotonic()
         self._gcp_key_file = None  # Temp file for GCP SA key
 
     def update_credentials(self, creds: Dict[str, str]):
@@ -533,6 +574,23 @@ class RealExecutor:
             else:
                 masked[k] = v[:12] + "..." if len(v) > 12 else v
         logger.info(f"  🔑 Credentials updated: {masked}")
+
+    def set_confirmed_credentials(self, creds: Dict[str, str]):
+        """Reset executor environment to the last confirmed credential set."""
+        self.cloud_env = dict(self.base_cloud_env)
+        for key in self._DYNAMIC_ENV_KEYS:
+            self.cloud_env.pop(key, None)
+        if creds:
+            self.update_credentials(creds)
+
+    def _budget_snapshot(self) -> BudgetSnapshot:
+        return BudgetSnapshot(
+            llm_requests_used=0,
+            llm_tokens_used=0,
+            http_requests_used=self.http_requests_used,
+            tool_calls_used=self.tool_calls_used,
+            elapsed_seconds=max(0.0, time.monotonic() - self.started_at),
+        )
 
     def _activate_gcp_service_account(self, key_json: str):
         """Write GCP SA key to temp file and activate."""
@@ -586,6 +644,24 @@ class RealExecutor:
             env = os.environ.copy()
             env.update(self.cloud_env)
 
+            if self.scope_guard:
+                target_urls = self.scope_guard.extract_network_targets(command)
+                decision = self.scope_guard.check_action(
+                    command=command,
+                    target_urls=target_urls,
+                    budget=self._budget_snapshot(),
+                )
+                if not decision.allowed:
+                    return {
+                        "command": command,
+                        "return_code": -1,
+                        "stdout": "",
+                        "stderr": decision.reason,
+                        "success": False,
+                        "failure_class": "scope_block",
+                        "scope_decision": decision.to_dict(),
+                    }
+
             cmd_timeout = self.timeout
             cmd_lower = command.lower()
             if any(kw in cmd_lower for kw in [
@@ -596,6 +672,9 @@ class RealExecutor:
             ]):
                 cmd_timeout = max(self.timeout, 60)
 
+            self.tool_calls_used += 1
+            if command.strip().lower().startswith(self.HTTP_TOOLS):
+                self.http_requests_used += 1
             proc = subprocess.run(
                 command,
                 shell=True,
@@ -1124,6 +1203,7 @@ class AIDrivenPipeline:
             "graph_lite": {"nodes": [], "edges": [], "summary": {}},
             "graph_lite_summary": "",
             # Evidence verifier outputs
+            "candidate_observations": [],
             "objective_verifications": [],
         }
 
@@ -1131,11 +1211,14 @@ class AIDrivenPipeline:
         self.execution_log: List[Dict] = []
         # Track stagnation — stop if no new findings for N consecutive rounds
         self._stagnation_counter = 0
-        self._last_findings_count = 0
+        self._last_progress_signature = (
+            progress_signature(self.state) if progress_signature else tuple()
+        )
         # Command dedup — normalised commands already executed (skip repeats)
         self._executed_commands: set = set()
         # Compact summary of commands run per round (for planner context)
         self._commands_run_summary: List[str] = []
+        self.executor.set_confirmed_credentials(self.state["credentials_found"])
 
     @staticmethod
     def _normalize_cmd(cmd: str) -> str:
@@ -1145,6 +1228,74 @@ class AIDrivenPipeline:
         c = re.sub(r"\s*\|\s*head\s*-\d+", "", c)
         c = re.sub(r"\s*\|\s*tail\s*-\d+", "", c)
         return c.strip()
+
+    def _sync_executor_credentials(self) -> None:
+        self.executor.set_confirmed_credentials(self.state.get("credentials_found", {}))
+
+    def _refresh_graph_snapshot(self) -> None:
+        if GRAPH_LITE_AVAILABLE and build_graph_lite_state:
+            try:
+                graph_lite = build_graph_lite_state(self.state, self.target_description)
+                self.state["graph_lite"] = graph_lite
+                self.state["graph_lite_summary"] = graph_lite.get("summary_text", "")
+            except Exception as e:
+                logger.debug(f"Graph-lite update failed: {e}")
+
+    def _verify_and_commit_task(
+        self,
+        task: Dict[str, Any],
+        task_name: str,
+        command_results: List[Dict[str, Any]],
+        state_before: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        verification = {
+            "task_name": task_name,
+            "task_id": task.get("id", task_name),
+            "action_id": task.get("action_id", task.get("id", task_name)),
+            "objective_type": task.get("objective_type", task.get("phase", "generic")),
+            "status": "unverified",
+            "confidence": 0.0,
+            "matched_rule_ids": [],
+            "supporting_evidence_ids": [],
+            "missing_evidence": ["objective_evidence_not_met"],
+            "reason": "task execution did not satisfy a verified objective",
+            "reportable": True,
+            "timestamp": datetime.now().isoformat(),
+        }
+        if not command_results:
+            verification["reason"] = "generator produced no executable commands"
+            verification["missing_evidence"] = ["generator_no_commands"]
+        elif EVIDENCE_VERIFIER_AVAILABLE and verify_task_execution:
+            try:
+                verification = verify_task_execution(
+                    task=task,
+                    command_results=command_results,
+                    state_before=state_before,
+                    state_after=self.state,
+                )
+            except Exception as e:
+                verification["reason"] = f"verifier error: {e}"
+                verification["missing_evidence"] = ["verifier_exception"]
+
+        verification.setdefault("task_name", task_name)
+        if STATE_COMMIT_AVAILABLE and finalize_transition:
+            finalize_transition(self.state, state_before, verification, task)
+        else:
+            self.state.setdefault("objective_verifications", []).append(dict(verification))
+
+        self._sync_executor_credentials()
+        self._refresh_graph_snapshot()
+
+        if verification.get("status") == "verified":
+            if task_name not in self.state["tasks_completed"]:
+                self.state["tasks_completed"].append(task_name)
+            logger.info(f"     🧪 Verifier: VERIFIED - {verification.get('reason', '')[:120]}")
+        else:
+            logger.info(
+                f"     🧪 Verifier: {str(verification.get('status', 'unknown')).upper()} - "
+                f"{verification.get('reason', '')[:120]}"
+            )
+        return verification
 
     # ─── Command Chaining Helpers ───────────────────────────────────────
     # Patterns for detecting "critical output" that should trigger re-generation
@@ -1594,11 +1745,15 @@ class AIDrivenPipeline:
             return "CREDENTIALS:\n" + "\n".join(parts)
         return None
 
-    def _inject_real_credentials(self, command: str) -> str:
+    def _inject_real_credentials(
+        self,
+        command: str,
+        state_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """Replace placeholder/example credentials in commands with REAL extracted credentials.
         This bypasses the LLM's tendency to use AKIAIOSFODNN7EXAMPLE or <SECRET>.
         """
-        creds = self.state.get("credentials_found", {})
+        creds = (state_snapshot or self.state).get("credentials_found", {})
         if not creds:
             return command
 
@@ -1636,25 +1791,21 @@ class AIDrivenPipeline:
         for pt in placeholder_tokens:
             command = command.replace(pt, real_token if real_token else "")
 
-        # If command is `aws ...` and still missing creds, prepend env vars
-        if command.strip().startswith("aws ") and "--no-sign-request" not in command:
-            if "AWS_ACCESS_KEY_ID" not in command and "export " not in command:
-                prefix = (
-                    f"export AWS_ACCESS_KEY_ID={shlex.quote(real_key)} && "
-                    f"export AWS_SECRET_ACCESS_KEY={shlex.quote(real_secret)}"
-                )
-                if real_token:
-                    prefix += f" && export AWS_SESSION_TOKEN={shlex.quote(real_token)}"
-                command = f"{prefix} && {command}"
-
         if command != original:
             logger.info(f"     🔧 Injected real credentials into command")
 
         return command
 
-    def _fix_region(self, command: str) -> str:
+    def _fix_region(
+        self,
+        command: str,
+        state_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """Fix wrong S3 region in commands using discovered region from state."""
-        discovered_region = self.state.get("target_info", {}).get("aws_region", "us-east-1")
+        discovered_region = (state_snapshot or self.state).get("target_info", {}).get(
+            "aws_region",
+            "us-east-1",
+        )
         if "s3" in command.lower():
             for wrong_region in ["eu-central-1", "eu-west-1", "ap-southeast-1", "us-west-2"]:
                 if wrong_region in command and wrong_region != discovered_region:
@@ -2494,43 +2645,45 @@ class AIDrivenPipeline:
         except Exception as e:
             logger.debug(f"Auto-discovery error: {e}")
 
-    def _execute_with_chaining(self, task: Dict, initial_commands: List[str],
-                                task_name: str, task_phase: str,
-                                round_num: int) -> List[Dict[str, Any]]:
-        """
-        Execute commands with chaining: after each command, check for critical
-        output. If found, re-call Generator with updated execution_history
-        so it can use real values (tokens, credentials) in follow-up commands.
-
-        Max 3 chaining iterations per task to prevent infinite loops.
-        """
-        commands_to_run = initial_commands[:10]  # Safety limit
-        chaining_iterations = 0
-        max_chaining = 3  # Max re-generation cycles per task
+    def _execute_with_chaining(
+        self,
+        task: Dict,
+        initial_commands: List[str],
+        task_name: str,
+        task_phase: str,
+        round_num: int,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Execute one planner-approved action batch against a tentative state snapshot."""
+        commands_to_run = initial_commands[:10]
         task_results: List[Dict[str, Any]] = []
-
-        while commands_to_run and chaining_iterations <= max_chaining:
-            critical_found_this_batch = {}
-
+        authoritative_state = self.state
+        tentative_state = copy.deepcopy(self.state)
+        self.state = tentative_state
+        try:
             for cmd in commands_to_run:
-                # ─── Pre-process command: inject real credentials, fix region ───
-                cmd = self._inject_real_credentials(cmd)
-                cmd = self._fix_region(cmd)
+                cmd = self._inject_real_credentials(cmd, state_snapshot=authoritative_state)
+                cmd = self._fix_region(cmd, state_snapshot=authoritative_state)
 
-                # Skip commands with remaining placeholders
-                if any(ph in cmd for ph in ["<TOKEN>", "<SECRET>", "<ACCESS_KEY>", "REAL_TOKEN_FROM_STEP1",
-                                             "REAL_TOKEN_FROM_PREVIOUS_COMMAND", "<SESSION_TOKEN>"]):
+                if any(
+                    ph in cmd
+                    for ph in (
+                        "<TOKEN>",
+                        "<SECRET>",
+                        "<ACCESS_KEY>",
+                        "REAL_TOKEN_FROM_STEP1",
+                        "REAL_TOKEN_FROM_PREVIOUS_COMMAND",
+                        "<SESSION_TOKEN>",
+                    )
+                ):
                     logger.info(f"     ⏭️ Skipping command with unresolved placeholders: {cmd[:80]}...")
                     continue
 
-                # Skip commands already executed in previous rounds (dedup)
                 norm = self._normalize_cmd(cmd)
                 if norm in self._executed_commands:
                     logger.info(f"     ♻️ Skipping duplicate command: {cmd[:80]}...")
                     continue
 
                 logger.info(f"     $ {cmd[:100]}{'...' if len(cmd) > 100 else ''}")
-
                 result = self.executor.run(cmd)
                 result["task"] = task_name
                 result["phase"] = task_phase
@@ -2544,160 +2697,20 @@ class AIDrivenPipeline:
                 if len(self._commands_run_summary) > 100:
                     self._commands_run_summary = self._commands_run_summary[-60:]
 
-                # Add to execution_history for chaining
                 self._add_to_execution_history(cmd, result)
-
                 if result["success"]:
                     stdout = result["stdout"]
                     logger.info(f"     ✅ Success ({len(stdout)} bytes)")
                     if stdout and len(stdout) < 200:
                         logger.info(f"        → {stdout[:150]}")
-
-                    # Parse output (passive sensing — credentials, vulns, etc.)
-                    self._parse_output(cmd, result)
-
-                    # Check for critical output that needs chaining
-                    critical = self._detect_critical_output(result)
-                    if critical:
-                        critical_found_this_batch.update(critical)
-                        for crit_name, crit_val in critical.items():
-                            masked = crit_val[:12] + "..." if len(crit_val) > 12 else crit_val
-                            logger.info(f"     🔗 CHAIN: Detected {crit_name} = {masked}")
                 else:
-                    stderr = result["stderr"]
-                    logger.info(f"     ❌ Failed: {stderr[:100]}")
+                    logger.info(f"     ❌ Failed: {result['stderr'][:100]}")
 
-                    # Also parse failed results — sometimes 405/401 give hints
-                    self._parse_output(cmd, result)
+                self._parse_output(cmd, result, task_context=task)
+        finally:
+            self.state = authoritative_state
 
-            # ─── Auto-follow discovered URLs (JS, level pages, API endpoints) ───
-            if self.state.get("urls_to_follow"):
-                task_results = self._auto_follow_urls(
-                    task_name, task_phase, round_num, task_results, max_follows=3
-                )
-
-            # ─── Chaining decision ───
-            # If we found critical output AND haven't exhausted chaining iterations,
-            # re-call Generator with updated state (including execution_history)
-            if critical_found_this_batch and chaining_iterations < max_chaining:
-                chaining_iterations += 1
-                logger.info(f"\n     🔗 CHAINING iteration {chaining_iterations}/{max_chaining}")
-                logger.info(f"        Critical values found: {list(critical_found_this_batch.keys())}")
-                logger.info(f"        Re-calling Generator with execution_history...")
-
-                # Create a chaining-specific task instruction
-                chain_task = task.copy()
-                original_instruction = chain_task.get("instruction", "")
-
-                # Build a hint about what was found
-                chain_hints = []
-                if "imdsv2_token" in critical_found_this_batch:
-                    token = critical_found_this_batch["imdsv2_token"]
-                    chain_hints.append(
-                        f"IMDSv2 TOKEN was extracted: {token[:50]}... "
-                        f"Use this EXACT token in X-aws-ec2-metadata-token header"
-                    )
-                if "iam_role" in critical_found_this_batch:
-                    role = critical_found_this_batch["iam_role"]
-                    chain_hints.append(
-                        f"IAM Role name found: {role}. "
-                        f"Get credentials from /latest/meta-data/iam/security-credentials/{role}"
-                    )
-                if "aws_access_key" in critical_found_this_batch:
-                    key = critical_found_this_batch["aws_access_key"]
-                    chain_hints.append(
-                        f"AWS Access Key found: {key}. "
-                        f"Use with aws CLI: export AWS_ACCESS_KEY_ID={key}"
-                    )
-                if "aws_secret_key" in critical_found_this_batch:
-                    chain_hints.append("AWS Secret Key found in previous output. Use it with aws CLI.")
-                if "aws_session_token" in critical_found_this_batch:
-                    chain_hints.append("AWS Session Token found. Set AWS_SESSION_TOKEN env var.")
-                if "bucket_name" in critical_found_this_batch:
-                    bucket = critical_found_this_batch["bucket_name"]
-                    chain_hints.append(f"S3 Bucket name found: {bucket}. Enumerate with aws s3 ls s3://{bucket}/")
-
-                artifacts = self.state.get("cloud_artifacts", {})
-                for pool_id in artifacts.get("cognito_pool_ids", [])[:2]:
-                    chain_hints.append(
-                        f"Cognito Identity Pool found: {pool_id}. "
-                        f"Use: aws cognito-identity get-id --identity-pool-id {pool_id}"
-                    )
-                for bucket in artifacts.get("s3_buckets", [])[:3]:
-                    if f"s3://{bucket}" not in str(chain_hints):
-                        chain_hints.append(f"S3 bucket discovered: {bucket}. Try: aws s3 ls s3://{bucket}/ --no-sign-request")
-                for level_url in artifacts.get("level_urls", [])[:5]:
-                    from urllib.parse import urlparse as _up2
-                    _lhost = _up2(level_url if "://" in level_url else f"http://{level_url}").hostname or ""
-                    if _lhost and f"s3://{_lhost}" not in str(chain_hints):
-                        chain_hints.append(
-                            f"Level URL discovered: {level_url}. "
-                            f"The hostname '{_lhost}' is likely an S3 bucket. "
-                            f"Try: aws s3 ls s3://{_lhost}/ --no-sign-request"
-                        )
-                for ecr in artifacts.get("ecr_repos", [])[:1]:
-                    chain_hints.append(f"ECR repo found: {ecr}. Pull and inspect the container image.")
-
-                chain_instruction = (
-                    f"CONTINUE from previous commands. {original_instruction}\n"
-                    f"CHAINING CONTEXT:\n" + "\n".join(f"- {h}" for h in chain_hints) +
-                    f"\nCheck execution_history for exact values from previous commands. "
-                    f"Use REAL values, NOT placeholders."
-                )
-                chain_task["instruction"] = chain_instruction
-                chain_task["name"] = f"{task_name} (chain #{chaining_iterations})"
-
-                # Re-call Generator
-                new_commands = self.api.get_commands(chain_task, self.target_description, self.state)
-                if new_commands:
-                    logger.info(f"        Generator produced {len(new_commands)} follow-up command(s)")
-                    commands_to_run = new_commands[:6]  # Slightly smaller limit for chained commands
-                else:
-                    logger.info(f"        Generator returned no follow-up commands")
-                    break
-            else:
-                # No critical output or max iterations reached
-                break
-
-        # ─── Automatic credential-use fallback ───
-        # If we extracted AWS creds but haven't successfully used them yet,
-        # directly inject and run the standard AWS enumeration commands.
-        # Only runs ONCE per pipeline (not every task).
-        creds = self.state.get("credentials_found", {})
-        if (creds.get("AWS_ACCESS_KEY_ID") and creds.get("AWS_SECRET_ACCESS_KEY")
-                and not self.state.get("exploits_successful")
-                and not getattr(self, '_auto_aws_ran', False)):
-            state_before_auto_aws = copy.deepcopy(self.state)
-            self._auto_aws_ran = True
-            self._run_auto_aws_commands(task_name, task_phase, round_num)
-
-            # Verify AUTO-AWS results
-            if EVIDENCE_VERIFIER_AVAILABLE and verify_task_execution:
-                try:
-                    auto_aws_results = [e for e in self.execution_log
-                                        if e.get("round") == round_num and "AUTO" in e.get("task", "")]
-                    if auto_aws_results:
-                        verification = verify_task_execution(
-                            task={"name": f"AUTO-AWS: {task_name}", "phase": task_phase},
-                            command_results=auto_aws_results,
-                            state_before=state_before_auto_aws,
-                            state_after=self.state,
-                        )
-                        self.state["objective_verifications"].append(verification)
-                        logger.info(f"     🧪 Verifier (AUTO-AWS): {verification.get('status', '?').upper()}")
-                except Exception as e:
-                    logger.debug(f"Evidence verifier (AUTO-AWS) failed: {e}")
-
-            # Update graph after AUTO-AWS
-            if GRAPH_LITE_AVAILABLE and build_graph_lite_state:
-                try:
-                    graph_lite = build_graph_lite_state(self.state, self.target_description)
-                    self.state["graph_lite"] = graph_lite
-                    self.state["graph_lite_summary"] = graph_lite.get("summary_text", "")
-                except Exception as e:
-                    logger.debug(f"     graph_lite build failed: {e}")
-
-        return task_results
+        return task_results, tentative_state
 
     def _try_get_s3_object(self, bucket_name: str, obj_key: str, cred_prefix: str,
                            target_url: str, task_phase: str, round_num: int):
@@ -3345,8 +3358,13 @@ class AIDrivenPipeline:
                 try:
                     skill, reason = route_planner_skill(self.state, self.target_description)
                     provider = infer_provider(self.state, self.target_description)
+                    stack = infer_stack(self.state)
                     examples = retrieve_planner_examples(
-                        skill, provider, max_examples=2, examples=_PLANNER_EXAMPLES_CACHE
+                        skill,
+                        provider,
+                        stack=stack,
+                        max_examples=2,
+                        examples=_PLANNER_EXAMPLES_CACHE,
                     )
                     fewshot_block = format_planner_fewshot_block(skill, reason, examples)
                     if fewshot_block:
@@ -3358,80 +3376,8 @@ class AIDrivenPipeline:
             tasks = self.api.get_plan(self.target_description, planner_state)
 
             if not tasks:
-                nothing_done = (
-                    round_num <= 1
-                    and not self.state["findings"]
-                    and not self.state["credentials_found"]
-                    and not self.state["exploits_successful"]
-                    and not self.state["tasks_completed"]
-                )
-                if nothing_done:
-                    cve_match = re.search(r"CVE-\d{4}-\d{4,7}", self.target_description, re.IGNORECASE)
-                    if cve_match:
-                        cve_id = cve_match.group(0).upper()
-                        logger.info(f"  ⚠️ Planner returned no tasks on round 1 — injecting CVE-targeted exploit task for {cve_id}")
-                        tasks = [{
-                            "id": 1,
-                            "name": f"Exploit {cve_id}",
-                            "instruction": (
-                                f"Test the target for {cve_id}. "
-                                f"Use curl with appropriate payloads to exploit this vulnerability. "
-                                f"Target: {self.target_description}. "
-                                f"URL: {self.state.get('target_url', '')}. "
-                                f"Try multiple payload variations. Read /etc/passwd or execute 'id' as proof."
-                            ),
-                            "phase": "exploit",
-                            "target_service": "web",
-                            "cve_id": cve_id,
-                        }]
-                    else:
-                        logger.info("  ⚠️ Planner returned no tasks on round 1 — injecting bootstrap security scan")
-                        tasks = [{
-                            "id": 1,
-                            "name": "Bootstrap Cloud Security Scan",
-                            "instruction": (
-                                f"Assess the cloud service at {self.state.get('target_url', '')}. "
-                                f"Check /env and /config for credential exposure, enumerate /api endpoints, "
-                                f"check /credentials, /secrets, /api/keys, /api/settings, /api/admin endpoints. "
-                                f"Test Jenkins (/api/json, /script, /credentials/store), "
-                                f"Azure (_apis, /api/functions, /api/host/keys), "
-                                f"K8s (/api/v1/namespaces, /api/v1/namespaces/default/secrets), "
-                                f"and Spring Boot (/actuator/env, /actuator/configprops) patterns."
-                            ),
-                            "phase": "exploit",
-                            "target_service": "web",
-                            "cve_id": None,
-                        }]
-                else:
-                    no_vulns_yet = (
-                        not self.state["vulnerabilities_found"]
-                        and not self.state["exploits_successful"]
-                        and round_num < max_rounds
-                        and self.target_url
-                    )
-                    if no_vulns_yet:
-                        logger.info("  ⚠️ Planner returned no tasks but no vulns found — injecting deep credential scan")
-                        discovered_eps = list(self.state.get("web_endpoints", []))[:15]
-                        ep_hint = f"Known endpoints: {', '.join(discovered_eps)}. " if discovered_eps else ""
-                        tasks = [{
-                            "id": 1,
-                            "name": "Deep Credential Exposure Scan",
-                            "instruction": (
-                                f"Deep scan {self.target_url} for credential exposure. "
-                                f"{ep_hint}"
-                                f"Try /api/*/keys, /api/*/secrets, /api/*/credentials for all discovered sub-APIs. "
-                                f"Check Jenkins /credentials/store/system/domain/_/credential/*/config.xml, "
-                                f"Azure /api/automation/accounts/*/credentials, "
-                                f"K8s /api/v1/namespaces/*/secrets. "
-                                f"Test SSRF via /proxy?url= and /fetch?url=."
-                            ),
-                            "phase": "exploit",
-                            "target_service": "web",
-                            "cve_id": None,
-                        }]
-                    else:
-                        logger.info("  ℹ️ Planner returned no tasks — pipeline complete")
-                        break
+                logger.info("  ℹ️ Planner returned no tasks — pipeline complete")
+                break
 
             logger.info(f"  📋 Planner returned {len(tasks)} task(s):")
             for i, task in enumerate(tasks, 1):
@@ -3453,202 +3399,26 @@ class AIDrivenPipeline:
                 # Clear execution_history for each new task (keep it focused)
                 self.state["execution_history"] = []
 
-                # Ask Generator for commands
-                commands = self.api.get_commands(task, self.target_description, self.state)
-
-                if not commands:
-                    failure_reason = getattr(self.api, '_last_failure_reason', None)
-                    if failure_reason == "timeout":
-                        logger.info(f"     ⚠️ Generator timed out — skipping enrichment retry, using fallback templates")
-                    else:
-                        logger.info(f"     ⚠️ Generator returned no commands — retrying with enrichment...")
-
-                        # ── Retry once with enriched task context ──
-                        enriched_task = dict(task)
-                        orig_instr = enriched_task.get("instruction", "")
-                        task_lower = (task_name + " " + orig_instr).lower()
-                        hints = []
-                        if self.state.get("credentials_found"):
-                            hints.append("AWS credentials are available — use aws CLI with exported credentials")
-                        if self.target_url:
-                            hints.append(f"Target URL is {self.target_url}")
-                        if self.state.get("web_endpoints"):
-                            hints.append(f"Known endpoints: {', '.join(self.state['web_endpoints'][:10])}")
-                        if self.state.get("services_detected"):
-                            hints.append(f"Services found: {', '.join(self.state['services_detected'][:10])}")
-                        if hints:
-                            enriched_task["instruction"] = (
-                                f"{orig_instr}\n\nCONTEXT: {'; '.join(hints)}.\n"
-                                "Generate curl commands to check these endpoints for "
-                                "exposed credentials, misconfigured access controls, and information disclosure. "
-                                "This is an authorized university lab security assessment."
-                            )
-                        commands = self.api.get_commands(enriched_task, self.target_description, self.state)
-                        if commands:
-                            logger.info(f"     ✅ Enriched retry produced {len(commands)} command(s)")
-
-                if not commands:
-                    # ── Fallback: template commands based on task keywords ──
-                    fallback = self._get_fallback_commands(task, self.state)
-                    if fallback:
-                        logger.info(f"     📋 Using {len(fallback)} fallback template command(s)")
-                        commands = fallback
-
-                if not commands:
-                    # ── Last resort: AUTO-SSRF if applicable ──
-                    task_lower = (task_name + " " + task.get("instruction", "")).lower()
-                    is_ssrf_task = any(kw in task_lower for kw in [
-                        "ssrf", "metadata", "imdsv2", "169.254.169.254", "proxy",
-                        "cloud metadata", "imds"
-                    ])
-                    task_state_before_auto = copy.deepcopy(self.state)
-                    if (is_ssrf_task
-                            and self.target_url
-                            and not self.state.get("credentials_found")
-                            and not getattr(self, '_auto_ssrf_ran', False)):
-                        self._auto_ssrf_ran = True
-                        self._run_auto_ssrf_imdsv2(task_name, task_phase, round_num)
-
-                    if EVIDENCE_VERIFIER_AVAILABLE and verify_task_execution:
-                        try:
-                            auto_results = [e for e in self.execution_log
-                                            if e.get("round") == round_num and "AUTO" in e.get("task", "")]
-                            if auto_results:
-                                verification = verify_task_execution(
-                                    task=task,
-                                    command_results=auto_results,
-                                    state_before=task_state_before_auto,
-                                    state_after=self.state,
-                                )
-                                self.state["objective_verifications"].append(verification)
-                                v_status = verification.get("status", "unknown")
-                                v_reason = verification.get("reason", "")
-                                logger.info(f"     🧪 Verifier (AUTO): {v_status.upper()} - {v_reason[:120]}")
-                        except Exception as e:
-                            logger.debug(f"Evidence verifier (AUTO) failed: {e}")
-
-                    if GRAPH_LITE_AVAILABLE and build_graph_lite_state:
-                        try:
-                            graph_lite = build_graph_lite_state(self.state, self.target_description)
-                            self.state["graph_lite"] = graph_lite
-                            self.state["graph_lite_summary"] = graph_lite.get("summary_text", "")
-                        except Exception as e:
-                            logger.debug(f"     graph_lite build failed: {e}")
-
-                    self.state["tasks_completed"].append(task_name)
-                    if self.state["flags_found"]:
-                        logger.info(f"\n  🎯🏆 FLAG FOUND! Stopping pipeline early.")
-                        logger.info(f"  🚩 Flag(s): {self.state['flags_found']}")
-                        break
-                    continue
-
-                logger.info(f"     Generator produced {len(commands)} command(s)")
-
-                # ─── Auto-discover endpoints on first task ───
-                if round_num == 1 and self.target_url:
-                    self._auto_discover_endpoints(
-                        self.target_url, task_name, task_phase, round_num
-                    )
-
-                # ─── Step 3: Execute with CHAINING ───
-                # This replaces the old simple loop. Now detects critical output
-                # (tokens, credentials, role names) and re-calls Generator
-                # with updated execution_history for follow-up commands.
                 task_state_before = copy.deepcopy(self.state)
-                task_exec_results = self._execute_with_chaining(
-                    task, commands, task_name, task_phase, round_num
+                commands = self.api.get_commands(task, self.target_description, self.state)
+                task_exec_results: List[Dict[str, Any]] = []
+                tentative_state = copy.deepcopy(task_state_before)
+
+                if commands:
+                    logger.info(f"     Generator produced {len(commands)} command(s)")
+                    task_exec_results, tentative_state = self._execute_with_chaining(
+                        task, commands, task_name, task_phase, round_num
+                    )
+                else:
+                    logger.info("     ⚠️ Generator returned no commands")
+
+                self.state = tentative_state
+                self._verify_and_commit_task(
+                    task=task,
+                    task_name=task_name,
+                    command_results=task_exec_results,
+                    state_before=task_state_before,
                 )
-
-                # ─── Step 4: Evidence verification (rule-based MVP) ───
-                if EVIDENCE_VERIFIER_AVAILABLE and verify_task_execution:
-                    try:
-                        verification = verify_task_execution(
-                            task=task,
-                            command_results=task_exec_results,
-                            state_before=task_state_before,
-                            state_after=self.state,
-                        )
-                        self.state["objective_verifications"].append(verification)
-                        # Keep compact history
-                        if len(self.state["objective_verifications"]) > 40:
-                            self.state["objective_verifications"] = self.state["objective_verifications"][-40:]
-
-                        v_status = verification.get("status", "unknown")
-                        v_reason = verification.get("reason", "")
-                        logger.info(f"     🧪 Verifier: {v_status.upper()} - {v_reason[:120]}")
-                    except Exception as e:
-                        logger.debug(f"Evidence verifier failed: {e}")
-
-                # ─── Update graph after each task ───
-                if GRAPH_LITE_AVAILABLE and build_graph_lite_state:
-                    try:
-                        graph_lite = build_graph_lite_state(self.state, self.target_description)
-                        self.state["graph_lite"] = graph_lite
-                        self.state["graph_lite_summary"] = graph_lite.get("summary_text", "")
-                    except Exception as e:
-                        logger.debug(f"     graph_lite build failed: {e}")
-
-                # ─── AUTO-SSRF after chaining if SSRF confirmed but no creds ───
-                ssrf_vuln_found = any(v.get("id") == "ssrf_confirmed"
-                                      for v in self.state.get("vulnerabilities_found", []))
-                if (ssrf_vuln_found
-                        and self.target_url
-                        and not self.state.get("credentials_found")
-                        and not getattr(self, '_auto_ssrf_ran', False)):
-                    logger.info(f"     🤖 SSRF confirmed but no creds — triggering AUTO-SSRF...")
-                    self._auto_ssrf_ran = True
-                    auto_state_before = copy.deepcopy(self.state)
-                    self._run_auto_ssrf_imdsv2(task_name, task_phase, round_num)
-                    if EVIDENCE_VERIFIER_AVAILABLE and verify_task_execution:
-                        try:
-                            auto_r = [e for e in self.execution_log
-                                      if e.get("round") == round_num and "AUTO" in e.get("task", "")]
-                            if auto_r:
-                                v = verify_task_execution(
-                                    task=task, command_results=auto_r,
-                                    state_before=auto_state_before, state_after=self.state)
-                                self.state["objective_verifications"].append(v)
-                                logger.info(f"     🧪 Verifier (AUTO-SSRF): {v.get('status', '?').upper()}")
-                        except Exception as e:
-                            logger.debug(f"     AUTO-SSRF error: {e}")
-
-                # ─── Supplement: if round found 0 vulns, run fallback web probes ───
-                round_found_vuln = any(
-                    v.get("round") == round_num
-                    for v in self.state.get("vulnerabilities_found", [])
-                )
-                if (not round_found_vuln
-                        and self.target_url
-                        and not getattr(self, '_web_supplement_ran', False)):
-                    exploit_task = {
-                        "name": "Exploit Supplement Probe",
-                        "instruction": f"Exploit pentest vuln path traversal rce injection bypass on target",
-                        "phase": "exploit",
-                    }
-                    supplement = self._get_fallback_commands(exploit_task, self.state)
-                    already_ran = {self._normalize_cmd(r.get("command", ""))
-                                   for r in self.execution_log}
-                    supplement = [c for c in supplement
-                                 if self._normalize_cmd(c) not in already_ran]
-                    if supplement:
-                        self._web_supplement_ran = True
-                        logger.info(f"     📋 No vulns from Generator commands — running {len(supplement)} supplement probe(s)")
-                        supp_state_before = copy.deepcopy(self.state)
-                        supp_results = self._execute_with_chaining(
-                            task, supplement, task_name + " (supplement)", task_phase, round_num
-                        )
-                        if EVIDENCE_VERIFIER_AVAILABLE and verify_task_execution and supp_results:
-                            try:
-                                v = verify_task_execution(
-                                    task=task, command_results=supp_results,
-                                    state_before=supp_state_before, state_after=self.state)
-                                self.state["objective_verifications"].append(v)
-                                logger.info(f"     🧪 Verifier (supplement): {v.get('status', '?').upper()} - {v.get('reason', '')[:100]}")
-                            except Exception as e:
-                                logger.debug(f"     Supplement verifier error: {e}")
-
-                # Mark task completed
-                self.state["tasks_completed"].append(task_name)
 
                 # ─── Check if flag was found during execution ───
                 if self.state["flags_found"]:
@@ -3680,15 +3450,11 @@ class AIDrivenPipeline:
                 logger.info(f"  📈 Phase transition: exploit → post")
 
             # ─── Stagnation detection ───
-            # If no new findings/exploits/artifacts for 3 consecutive rounds, stop
-            artifacts = self.state.get("cloud_artifacts", {})
-            artifact_count = sum(len(v) for v in artifacts.values() if isinstance(v, list))
-            current_findings = (len(self.state["findings"]) +
-                                len(self.state["credential_sets"]) +
-                                len(self.state["vulnerabilities_found"]) +
-                                len(self.state["exploits_successful"]) +
-                                artifact_count)
-            if current_findings == self._last_findings_count:
+            # Compare canonical identifiers, not only collection cardinalities (Eq. 24-25).
+            current_signature = (
+                progress_signature(self.state) if progress_signature else tuple()
+            )
+            if current_signature == self._last_progress_signature:
                 self._stagnation_counter += 1
                 if self._stagnation_counter >= 3:
                     logger.info(f"\n  ⏸️ No new findings for {self._stagnation_counter} "
@@ -3696,7 +3462,7 @@ class AIDrivenPipeline:
                     break
             else:
                 self._stagnation_counter = 0
-                self._last_findings_count = current_findings
+                self._last_progress_signature = current_signature
 
         # ─── Generate report ───
         elapsed = time.time() - start_time
@@ -4098,7 +3864,7 @@ class AIDrivenPipeline:
         r"curl.*/fetch\?url=",
     ]
 
-    def _parse_output(self, command: str, result: Dict):
+    def _parse_output(self, command: str, result: Dict, task_context: Optional[Dict[str, Any]] = None):
         """
         Passively parse command output — multi-cloud sensing.
         This is SENSING, not DECIDING.
@@ -4136,8 +3902,6 @@ class AIDrivenPipeline:
 
                 self.state["credentials_found"].update(new_creds)
                 self._store_credential_set(self.state["credentials_found"])
-                # Update executor so subsequent commands use these creds
-                self.executor.update_credentials(new_creds)
 
         # ── Extract flags ──
         flags = OutputParser.extract_flags(combined)
@@ -4152,16 +3916,12 @@ class AIDrivenPipeline:
         for finding in findings:
             if finding not in self.state["findings"]:
                 self.state["findings"].append(finding)
-        if len(self.state["findings"]) > 200:
-            self.state["findings"] = self.state["findings"][-150:]
 
         # ── Extract secrets ──
         secrets = OutputParser.extract_secrets(stdout, command[:30])
         for secret in secrets:
             if secret not in self.state["secrets_found"]:
                 self.state["secrets_found"].append(secret)
-        if len(self.state["secrets_found"]) > 100:
-            self.state["secrets_found"] = self.state["secrets_found"][-60:]
 
         # ── Scan for vulnerabilities in output + command context ──
         # We check both command and output because vuln indicators can appear
@@ -4222,23 +3982,18 @@ class AIDrivenPipeline:
                     if GRAPH_LITE_AVAILABLE and self.state.get("graph_lite"):
                         try:
                             from cage_cloud.graph import GraphState
+                            current_task = task_context or {}
                             graph = GraphState()
                             graph.add_failure(
-                                action_type=current_task.get("name", "unknown_exploit"),
+                                action_type=current_task.get("name", result.get("task", "unknown_exploit")),
                                 reason=stderr[:200] if stderr else "non-zero exit",
                             )
                             self.state.setdefault("graph_failure_counts", {})
-                            action_key = current_task.get("name", "unknown")
+                            action_key = current_task.get("name", result.get("task", "unknown"))
                             self.state["graph_failure_counts"][action_key] = \
                                 self.state["graph_failure_counts"].get(action_key, 0) + 1
                         except Exception:
                             pass
-
-        # ── Cap exploit lists ──
-        if len(self.state["exploits_successful"]) > 100:
-            self.state["exploits_successful"] = self.state["exploits_successful"][-80:]
-        if len(self.state["exploits_failed"]) > 100:
-            self.state["exploits_failed"] = self.state["exploits_failed"][-80:]
 
         # ── Parse error signals (stderr or false-positive stdout) ──
         combined_err = (stderr + " " + (stdout if self._is_false_positive_success(result) else "")).lower()
@@ -4290,21 +4045,6 @@ class AIDrivenPipeline:
         if result["success"] and ("s3" in cmd_lower or "list-buckets" in cmd_lower):
             if "s3" not in self.state["services_detected"]:
                 self.state["services_detected"].append("s3")
-
-        # Auto-download interesting files from successful S3 ls
-        if result["success"] and "s3 ls s3://" in command and stdout.strip():
-            bucket_match = re.search(r"s3 ls s3://([a-zA-Z0-9._-]+)/?", command)
-            if bucket_match:
-                ls_bucket = bucket_match.group(1)
-                sign_flag = "--no-sign-request" if "--no-sign-request" in command else ""
-                self._auto_s3_download_interesting(
-                    bucket=ls_bucket,
-                    s3_ls_stdout=stdout,
-                    sign_flag=sign_flag,
-                    task_name=result.get("task", "AUTO"),
-                    task_phase=result.get("phase", "enum"),
-                    round_num=result.get("round", self.state.get("round", 0)),
-                )
 
         # AWS IAM
         if result["success"] and ("iam" in cmd_lower or "sts" in cmd_lower):
@@ -4535,6 +4275,54 @@ class AIDrivenPipeline:
         return "\n".join(lines)
 
 
+def _default_scope_policy(target_url: Optional[str]) -> Optional["ScopePolicy"]:
+    if not SCOPE_GUARD_AVAILABLE or ScopePolicy is None:
+        return None
+    allowed_hosts: List[str] = []
+    if target_url:
+        host = urlparse(target_url).hostname or ""
+        if host:
+            allowed_hosts.append(host)
+    return ScopePolicy(
+        allowed_hosts=allowed_hosts,
+        allowed_tools=[
+            "curl",
+            "wget",
+            "grep",
+            "head",
+            "tail",
+            "sort",
+            "sed",
+            "awk",
+            "jq",
+            "nmap",
+            "openssl",
+            "dig",
+            "nikto",
+            "sslscan",
+            "testssl",
+            "gobuster",
+            "ffuf",
+            "aws",
+            "az",
+            "gcloud",
+            "gsutil",
+            "kubectl",
+        ],
+        blocked_command_patterns=[
+            "rm -rf*",
+            "*mkfs*",
+            "*shutdown*",
+            "*reboot*",
+            "*nc -e*",
+            "*bash -i*",
+            "*curl*--upload-file*",
+            "*scp *",
+            "*rsync *",
+        ],
+    )
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -4652,11 +4440,13 @@ Examples:
         planner_model=args.planner_model,
         generator_model=args.generator_model,
     )
+    scope_policy = _default_scope_policy(args.target_url)
     executor = RealExecutor(
         cloud_env=cloud_env if cloud_env else None,
         aws_profile=args.aws_profile,
         gcp_project=args.gcp_project,
         azure_subscription=args.azure_subscription,
+        scope_guard=ScopeGuard(scope_policy) if scope_policy and ScopeGuard else None,
     )
 
     # If Azure SP creds provided, do initial login

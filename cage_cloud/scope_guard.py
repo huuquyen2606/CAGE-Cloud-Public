@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from fnmatch import fnmatch
+import re
+import shlex
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
 
@@ -23,6 +25,7 @@ class ScopePolicy:
     allowed_url_prefixes: List[str] = field(default_factory=list)
     blocked_domains: List[str] = field(default_factory=list)
     blocked_command_patterns: List[str] = field(default_factory=list)
+    allowed_tools: List[str] = field(default_factory=list)
     max_llm_requests: Optional[int] = None
     max_llm_tokens: Optional[int] = None
     max_http_requests: Optional[int] = None
@@ -81,7 +84,42 @@ class ScopeGuard:
             if fnmatch(lower_cmd, pattern.lower()) or pattern.lower() in lower_cmd:
                 return GuardDecision(False, f"Blocked command pattern matched: {pattern}", "BLOCKED_COMMAND_PATTERN")
 
+        # Existing read-only command templates use pipes. Check every segment,
+        # but reject composition that could append an uninspected command.
+        if any(token in cmd for token in ("&&", "||", ";", "`", "$(", "\n", "\r")):
+            return GuardDecision(False, "Shell command composition is not allowed", "SHELL_COMPOSITION")
+
+        if self.policy.allowed_tools:
+            allowed = {tool.lower() for tool in self.policy.allowed_tools}
+            for segment in cmd.split("|"):
+                try:
+                    tokens = shlex.split(segment)
+                except ValueError:
+                    return GuardDecision(False, "Command has invalid shell quoting", "INVALID_QUOTING")
+                tokens = [token for token in tokens if not re.fullmatch(r"\d*>.*", token)]
+                if not tokens:
+                    continue
+                tool = tokens[0].rsplit("/", 1)[-1].lower()
+                if tool not in allowed:
+                    return GuardDecision(False, f"Tool is not allowlisted: {tool}", "TOOL_NOT_ALLOWED")
+
         return GuardDecision(True, "Command allowed by policy", "COMMAND_ALLOWED")
+
+    @staticmethod
+    def extract_network_targets(command: str) -> List[str]:
+        """Extract executor-visible URLs, excluding opaque data arguments."""
+        try:
+            tokens = shlex.split(command or "")
+        except ValueError:
+            return []
+        targets: List[str] = []
+        data_options = {"-d", "--data", "--data-raw", "--data-binary", "-H", "--header"}
+        for index, token in enumerate(tokens):
+            if token in data_options or (index and tokens[index - 1] in data_options):
+                continue
+            if token.startswith(("http://", "https://")):
+                targets.append(token)
+        return targets
 
     def check_budget(self, budget: BudgetSnapshot) -> GuardDecision:
         checks = [

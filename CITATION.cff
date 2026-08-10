@@ -1,0 +1,49 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the preferred citation below."
+title: "CAGE-Cloud"
+type: software
+license: Apache-2.0
+repository-code: "https://github.com/TuanHung1149/CAGE-Cloud-Public"
+authors:
+  - family-names: "Nguyen Huu"
+    given-names: "Quyen"
+    email: "quyennh@uit.edu.vn"
+  - family-names: "Nguyen Tuan"
+    given-names: "Hung"
+    email: "24520616@gm.uit.edu.vn"
+  - family-names: "Phan Thi Nhu"
+    given-names: "Huynh"
+    email: "24520717@gm.uit.edu.vn"
+  - family-names: "Le Pham Khanh"
+    given-names: "Linh"
+    email: "24520959@gm.uit.edu.vn"
+  - family-names: "Nguyen Thi My"
+    given-names: "Duyen"
+    email: "24520408@gm.uit.edu.vn"
+  - family-names: "Pham"
+    given-names: "Van-Hau"
+    email: "haupv@uit.edu.vn"
+keywords:
+  - "autonomous penetration testing"
+  - "cloud security"
+  - "agentic framework"
+  - "large language models"
+  - "evidence verification"
+  - "graph-based reasoning"
+preferred-citation:
+  type: article
+  title: "CAGE-Cloud: Evidence-Grounded Autonomous Cloud Penetration Testing with Authoritative Structured State"
+  year: 2026
+  authors:
+    - family-names: "Nguyen Huu"
+      given-names: "Quyen"
+    - family-names: "Nguyen Tuan"
+      given-names: "Hung"
+    - family-names: "Phan Thi Nhu"
+      given-names: "Huynh"
+    - family-names: "Le Pham Khanh"
+      given-names: "Linh"
+    - family-names: "Nguyen Thi My"
+      given-names: "Duyen"
+    - family-names: "Pham"
+      given-names: "Van-Hau"

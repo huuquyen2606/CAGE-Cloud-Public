@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""
-Rule-based Skill Router + planner few-shot retriever (MVP).
-"""
+"""Deterministic skill routing and contextual-example retrieval (paper Section 4.2.2)."""
 
 from __future__ import annotations
 
@@ -26,64 +24,119 @@ def infer_provider(state: Dict[str, Any], target_description: str = "") -> str:
     return "aws"
 
 
+def infer_stack(state: Dict[str, Any]) -> str:
+    """Return the first normalized software-stack label available in committed state."""
+    for key in ("software_stack", "stack"):
+        value = state.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    services = state.get("services_detected", []) or []
+    return str(services[0]).strip().lower() if services else "generic"
+
+
+def _verified_objectives(state: Dict[str, Any]) -> set[str]:
+    return {
+        str(item.get("objective_type", ""))
+        for item in state.get("objective_verifications", []) or []
+        if isinstance(item, dict) and item.get("status") == "verified"
+    }
+
+
 def route_planner_skill(state: Dict[str, Any], target_description: str = "") -> Tuple[str, str]:
-    phase = str(state.get("current_phase", "recon")).lower()
+    """Select the first matching family in the fixed priority order from paper Table 2."""
     endpoints = state.get("web_endpoints", []) or []
-    creds = state.get("credentials_found", {}) or {}
+    credentials = state.get("credentials_found", {}) or {}
     cves = state.get("cve_candidates", []) or []
-    failed_exploits = len(state.get("exploits_failed", []) or [])
-    success_exploits = len(state.get("exploits_successful", []) or [])
+    failures = state.get("failure_history", []) or state.get("exploits_failed", []) or []
+    verified = _verified_objectives(state)
 
-    has_proxy = any("/proxy" in str(ep).lower() for ep in endpoints)
-    has_target_url = bool(state.get("target_url"))
+    has_proxy = any(
+        marker in str(endpoint).lower()
+        for endpoint in endpoints
+        for marker in ("/proxy", "ssrf", "redirect", "fetch")
+    )
+    has_auth_workflow = "auth_workflow_detected" in verified or any(
+        marker in str(endpoint).lower()
+        for endpoint in endpoints
+        for marker in ("login", "auth", "signin", "oauth")
+    )
+    has_session = "session_acquired" in verified or bool(state.get("sessions"))
+    has_exploit_effect = "exploit_effect_confirmed" in verified
+    has_post_resource = "post_exploit_pivot" in verified or bool(
+        state.get("cloud_resources") or state.get("protected_resources")
+    )
+    has_verified_precondition = "precondition_satisfied" in verified
 
-    if failed_exploits >= 2 and failed_exploits >= success_exploits:
-        return "replan_after_fail", "Multiple exploit failures detected; replan required"
-    if has_proxy and not creds:
-        return "ssrf_to_metadata", "Proxy/SSRF surface exists but credentials not extracted yet"
-    if creds:
-        return "cloud_enum_after_creds", "Credentials available; prioritize cloud resource enumeration"
-    if cves and phase in {"enum", "exploit"}:
-        return "cve_validation", "CVE candidates exist and phase requires validation/exploitation planning"
-    if has_target_url and not endpoints:
-        return "web_recon_bootstrap", "Target URL present but endpoints not discovered"
-    return "general_recon", "Default reconnaissance planning"
+    if len(failures) >= 2:
+        return (
+            "replan_after_failure",
+            "At least two failures are committed and the failed path requires revision",
+        )
+    if has_exploit_effect or has_post_resource:
+        return (
+            "post_exploit_pivot",
+            "A verified exploitation effect or newly accessible resource is available",
+        )
+    if has_auth_workflow and not has_session:
+        return (
+            "auth_bypass_or_session",
+            "An authentication workflow is present without a verified session",
+        )
+    if has_proxy and not credentials:
+        return (
+            "ssrf_to_metadata",
+            "An SSRF/proxy surface is present without a usable cloud credential",
+        )
+    if credentials:
+        return (
+            "cloud_enum_after_creds",
+            "A credential-like artifact is available for provider validation or enumeration",
+        )
+    if cves and has_verified_precondition:
+        return (
+            "safe_exploit_validation",
+            "A CVE candidate has verified preconditions for controlled validation",
+        )
+    if cves:
+        return (
+            "version_and_cve_validation",
+            "A CVE candidate exists but applicability evidence remains incomplete",
+        )
+    return (
+        "web_recon_bootstrap",
+        "No committed service or endpoint context is available for the initial target",
+    )
 
 
 def load_planner_examples(path: Path = DEFAULT_FEWSHOT_PATH) -> List[Dict[str, Any]]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(raw, list):
-            return [x for x in raw if isinstance(x, dict)]
-    except Exception:
-        pass
-    return []
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
 
 
 def retrieve_planner_examples(
     skill: str,
     provider: str,
+    stack: str = "generic",
     max_examples: int = 2,
     examples: List[Dict[str, Any]] | None = None,
 ) -> List[Dict[str, Any]]:
+    """Rank examples with s(e)=10 I_skill + 4 I_provider + 2 I_stack."""
     examples = examples if examples is not None else load_planner_examples()
-    provider = (provider or "aws").lower()
+    provider = (provider or "").lower()
+    stack = (stack or "").lower()
 
-    def score(ex: Dict[str, Any]) -> int:
-        ex_skill = str(ex.get("skill", "")).lower()
-        ex_provider = str(ex.get("provider", "any")).lower()
-        s = 0
-        if ex_skill == skill:
-            s += 10
-        if ex_provider == provider:
-            s += 4
-        elif ex_provider == "any":
-            s += 1
-        return s
+    def score(example: Dict[str, Any]) -> int:
+        return (
+            10 * (str(example.get("skill", "")).lower() == skill.lower())
+            + 4 * (str(example.get("provider", "")).lower() == provider)
+            + 2 * (str(example.get("stack", "")).lower() == stack)
+        )
 
-    ranked = sorted(examples, key=score, reverse=True)
-    out = [ex for ex in ranked if score(ex) > 0][:max_examples]
-    return out
+    ranked = sorted(examples, key=lambda item: (-score(item), str(item.get("id", ""))))
+    return ranked[: max(0, max_examples)]
 
 
 def format_planner_fewshot_block(
@@ -99,15 +152,16 @@ def format_planner_fewshot_block(
         f"- Selected skill: {skill}",
         f"- Reason: {reason}",
         "",
-        "FEW-SHOT EXAMPLES (Planner should follow schema/style, do not copy values blindly):",
+        "CONTEXTUAL EXAMPLES (follow the schema; do not copy values):",
     ]
-
-    for i, ex in enumerate(examples, 1):
-        lines.append(f"\nExample #{i} [{ex.get('id', 'n/a')}]")
-        lines.append("Input State Summary:")
-        lines.append(json.dumps(ex.get("input_state", {}), ensure_ascii=False))
-        lines.append("Expected Planner Output JSON:")
-        lines.append(json.dumps(ex.get("output", {}), ensure_ascii=False))
-
+    for index, example in enumerate(examples, 1):
+        lines.extend(
+            [
+                f"\nExample #{index} [{example.get('id', 'n/a')}]",
+                "Input State Summary:",
+                json.dumps(example.get("input_state", {}), ensure_ascii=False),
+                "Expected Planner Output JSON:",
+                json.dumps(example.get("output", {}), ensure_ascii=False),
+            ]
+        )
     return "\n".join(lines)
-

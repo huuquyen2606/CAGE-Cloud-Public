@@ -1,1 +1,1 @@
-"""Metrics aggregation (ECR, FCR, Req@T/S, Tok@T/S, SPM)."""
+"""Paper-aligned metrics aggregation (FRR with cluster bootstrap, telemetry, and efficiency)."""

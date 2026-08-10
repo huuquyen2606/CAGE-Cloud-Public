@@ -1,803 +1,412 @@
 #!/usr/bin/env python3
+"""Compute the outcome and telemetry metrics defined in paper Section 5.5.
+
+The external outcome is delegated to :mod:`testbed.flag_oracle`; internal
+verifier records, return codes, and exploit-labelled commands never establish
+Flag Recovery Rate (FRR).
 """
-Comprehensive Evaluation Metrics for Automated Pentest System.
 
-Computes ALL metrics from the evaluation framework:
-  A. End-to-End Effectiveness: E2E-PSR, Difficulty-wise SR
-  B. Stage-level Success: CSR_V, CSR_E
-  C. Step-level Success: SSR, SSR_R, SSR_V, SSR_E
-  D. LLM Efficiency: Req@Target, Req@Success, Tok@Target, Tok@Success, SPM
-
-Reads from:
-  - pipeline_results_86_generic/*_state.json  (state data)
-  - pipeline_results_86_generic/*_output.txt  (LLM call logs)
-
-Outputs:
-  - pipeline_results_86_generic/metrics_full.csv      (per-target detailed)
-  - pipeline_results_86_generic/evaluation_report.md  (aggregate summary)
-"""
+from __future__ import annotations
 
 import csv
-import glob
 import json
-import os
-import re
+import math
+import random
+import statistics
 import sys
-from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Sequence
+
+from testbed.flag_oracle import evaluate_results_dir, load_manifest
 
 
-RESULTS_DIR = os.path.join(os.path.dirname(__file__), "pipeline_results_86_generic")
-
-CVE_DIFFICULTY = {
-    "CVE-2018-12907": "easy",
-    "CVE-2019-10379": "medium",
-    "CVE-2021-3062": "hard",
-    "CVE-2021-40829": "medium",
-    "CVE-2022-1805": "medium",
-    "CVE-2022-27198": "medium",
-    "CVE-2022-27199": "medium",
-    "CVE-2022-29052": "easy",
-    "CVE-2022-30570": "medium",
-    "CVE-2022-36917": "easy",
-    "CVE-2022-46831": "hard",
-    "CVE-2023-23408": "medium",
-    "CVE-2023-25956": "medium",
-    "CVE-2023-29332": "hard",
-    "CVE-2023-32988": "easy",
-    "CVE-2023-32989": "easy",
-    "CVE-2023-33185": "medium",
-    "CVE-2023-35165": "medium",
-    "CVE-2023-36052": "hard",
-    "CVE-2023-37580": "medium",
-    "CVE-2023-40035": "medium",
-    "CVE-2023-4105": "easy",
-    "CVE-2023-42780": "easy",
-    "CVE-2023-46747": "hard",
-    "CVE-2023-48788": "hard",
-    "CVE-2024-0200": "hard",
-    "CVE-2024-10924": "medium",
-    "CVE-2024-21733": "easy",
-    "CVE-2024-23897": "hard",
-    "CVE-2024-27316": "medium",
-    "CVE-2024-28255": "medium",
-    "CVE-2024-29824": "hard",
-    "CVE-2024-34102": "hard",
-    "CVE-2024-38077": "hard",
-    "CVE-2024-38194": "hard",
-    "CVE-2024-38473": "medium",
-    "CVE-2024-38856": "hard",
-    "CVE-2024-4577": "medium",
-    "CVE-2024-47176": "medium",
-    "CVE-2024-50379": "medium",
-    "CVE-2024-5452": "medium",
-    "CVE-2024-6387": "hard",
-    "CVE-2025-0411": "easy",
-    "CVE-2025-1094": "hard",
-    "CVE-2025-24813": "medium",
-    "CVE-2025-29927": "medium",
-    "CVE-2025-30208": "easy",
-    "CVE-2025-31161": "medium",
-    "CVE-2025-32433": "hard",
-    "CVE-2025-34028": "hard",
-    "CVE-2025-3462": "medium",
-    "CVE-2025-3463": "medium",
-    "CVE-2025-43917": "easy",
-    "CVE-2025-47989": "medium",
-    "CVE-2025-49692": "medium",
-    "CVE-2025-49707": "medium",
-    "CVE-2025-49746": "easy",
-    "CVE-2025-49747": "easy",
-    "CVE-2025-49752": "easy",
-    "CVE-2025-53729": "medium",
-    "CVE-2025-53763": "medium",
-    "CVE-2025-53767": "easy",
-    "CVE-2025-53781": "medium",
-    "CVE-2025-53792": "easy",
-    "CVE-2025-53793": "medium",
-    "CVE-2025-54914": "medium",
-    "CVE-2025-55316": "easy",
-    "CVE-2025-55697": "medium",
-    "CVE-2025-58724": "medium",
-    "CVE-2025-59048": "medium",
-    "CVE-2025-59247": "easy",
-    "CVE-2025-59273": "easy",
-    "CVE-2025-59285": "easy",
-    "CVE-2025-59291": "medium",
-    "CVE-2025-59292": "medium",
-    "CVE-2025-59494": "easy",
-    "CVE-2025-59500": "easy",
-    "CVE-2025-8069": "medium",
-    "CVE-2026-1727": "medium",
-    # --- 41 additional CVEs from cloud_cve_labs ---
-    "CVE-2023-41944": "easy",       # Jenkins Stored XSS
-    "CVE-2023-43784": "hard",       # Terraform Enterprise unauth workspace/state access
-    "CVE-2023-50928": "medium",     # SAP Cloud unauth admin access
-    "CVE-2023-51386": "hard",       # AWS CodeBuild command injection via git clone
-    "CVE-2024-12408": "easy",       # WordPress plugin auth bypass + cred exposure
-    "CVE-2024-23680": "easy",       # AWS Amplify auth config exposure + token leak
-    "CVE-2024-24753": "easy",       # AWS Lambda Bref PHP runtime cred exposure
-    "CVE-2024-25131": "hard",       # Red Hat OpenShift API unauth access
-    "CVE-2024-30164": "medium",     # AWS Client VPN credential leakage
-    "CVE-2024-30165": "hard",       # Azure DevOps request spoofing + impersonation
-    "CVE-2024-35261": "medium",     # Azure IoT Hub unauth device/key access
-    "CVE-2024-35266": "medium",     # Azure DevOps Server info disclosure (PATs, secrets)
-    "CVE-2024-35267": "medium",     # Azure DevOps service endpoint spoofing
-    "CVE-2024-37293": "medium",     # AWS CDK CLI permission escalation
-    "CVE-2024-37325": "easy",       # Azure Data Science VM Jupyter cred exposure
-    "CVE-2024-38092": "hard",       # Azure CycleCloud privilege escalation
-    "CVE-2024-38097": "easy",       # Azure Monitor Agent info disclosure
-    "CVE-2024-38098": "hard",       # Azure Arc command injection + privesc
-    "CVE-2024-38157": "hard",       # Azure IoT Hub SDK RCE (double-free)
-    "CVE-2024-38158": "hard",       # Azure IoT SDK device twin command injection
-    "CVE-2024-38162": "hard",       # Azure Arc extension installer bypass
-    "CVE-2024-38179": "easy",       # Azure Stack HCI info disclosure
-    "CVE-2024-38188": "medium",     # Azure Network Watcher VM Agent privesc
-    "CVE-2024-38195": "hard",       # Azure CycleCloud RCE
-    "CVE-2024-42006": "easy",       # Keyfactor AWS Orchestrator info disclosure
-    "CVE-2025-0508": "medium",      # AWS SageMaker pipeline MD5 integrity bypass
-    "CVE-2025-14503": "medium",     # Harmonix on AWS IAM trust policy privesc
-    "CVE-2025-26683": "medium",     # Azure Playwright Testing improper authz
-    "CVE-2025-27489": "easy",       # Azure SQL Managed Instance info disclosure
-    "CVE-2025-29813": "hard",       # Azure DevOps Server privilege escalation
-    "CVE-2025-29827": "hard",       # Azure Automation privilege escalation
-    "CVE-2025-29972": "hard",       # Azure Storage SSRF
-    "CVE-2025-29973": "easy",       # Azure Storage SDK info disclosure
-    "CVE-2025-30387": "easy",       # Azure Key Vault info disclosure
-    "CVE-2025-30389": "medium",     # Azure AI Services unauth model endpoint
-    "CVE-2025-30390": "hard",       # Azure ML Compute privilege escalation
-    "CVE-2025-30392": "hard",       # Azure AI Foundry privilege escalation
-    "CVE-2025-33072": "easy",       # Azure AI Foundry model registry info disclosure
-    "CVE-2025-33074": "easy",       # Azure AI Model Registry unauth version access
-    "CVE-2025-47158": "hard",       # Azure DevOps auth bypass
-    "CVE-2025-47988": "hard",       # Azure DevOps privilege escalation
-}
+EXPECTED_BACKBONES = 6
 
 
 @dataclass
-class TargetMetrics:
-    cve: str = ""
-    port: int = 0
-    difficulty: str = "medium"
-    services: str = ""
-
-    # A. E2E
-    e2e_success: int = 0  # 1 = evidence-verified pentest success
-
-    # B. Stage success (binary per target)
-    recon_success: int = 0       # R: service/tech identified
-    vuln_analysis_success: int = 0  # V: vuln identified
-    exploit_success: int = 0     # E: exploit confirmed
-
-    # C. Step-level (attempted / succeeded)
-    # Recon steps
-    step_host_reachable_a: int = 0
-    step_host_reachable_s: int = 0
-    step_tech_detect_a: int = 0
-    step_tech_detect_s: int = 0
-    step_endpoint_discovery_a: int = 0
-    step_endpoint_discovery_s: int = 0
-    step_cloud_detect_a: int = 0
-    step_cloud_detect_s: int = 0
-    step_version_inference_a: int = 0
-    step_version_inference_s: int = 0
-
-    # Vuln analysis steps
-    step_cve_generation_a: int = 0
-    step_cve_generation_s: int = 0
-    step_applicability_a: int = 0
-    step_applicability_s: int = 0
-
-    # Exploit steps
-    step_payload_gen_a: int = 0
-    step_payload_gen_s: int = 0
-    step_exploit_exec_a: int = 0
-    step_exploit_exec_s: int = 0
-    step_evidence_verify_a: int = 0
-    step_evidence_verify_s: int = 0
-
-    # D. LLM metrics
+class RunMetrics:
+    run_id: str
+    cve: str
+    architecture: str
+    backbone: str
+    severity: str = ""
+    cloud_type: str = ""
+    flag_recovered: int = 0
+    protocol_valid: int = 1
+    vulnerability_indicators: int = 0
+    exploit_activity: int = 0
+    services: int = 0
+    credentials: int = 0
     llm_requests: int = 0
-    planner_requests: int = 0
-    generator_requests: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
 
-    # Raw counts
-    total_commands: int = 0
-    findings_count: int = 0
-    vulns_count: int = 0
-    exploits_ok_count: int = 0
-    exploits_fail_count: int = 0
-    creds_found: int = 0
-    rounds: int = 0
+
+def _count(value: Any) -> int:
+    return len(value) if isinstance(value, (dict, list, tuple, set)) else 0
 
 
-def count_llm_calls_from_output(output_path: str) -> Dict[str, int]:
-    """Extract LLM call counts from pipeline output log."""
-    try:
-        text = open(output_path, encoding="utf-8", errors="replace").read()
-    except FileNotFoundError:
-        return {"planner": 0, "generator": 0, "total": 0}
-
-    planner_chat = len(re.findall(
-        r"Planner /plan returned 502.*chat/completions|"
-        r"Planner API timeout.*chat/completions|"
-        r"Planner API error.*chat/completions",
-        text,
-    ))
-    planner_direct = len(re.findall(r"Planner reasoning:", text))
-    planner_total = planner_chat + planner_direct
-    planner_nochat = len(re.findall(
-        r"Planner \(chat\) returned \d+ task|"
-        r"Planner returned no tasks",
-        text,
-    ))
-    if planner_nochat > planner_total:
-        planner_total = planner_nochat
-
-    generator_chat = len(re.findall(
-        r"Generator /generate returned 502.*chat/completions|"
-        r"Generator API timeout.*chat/completions|"
-        r"Generator API error.*chat/completions",
-        text,
-    ))
-    generator_direct = len(re.findall(r"Generator produced \d+ command", text))
-    generator_total = generator_chat + generator_direct
-
-    chat_total = len(re.findall(r"/chat/completions", text))
-
-    total = max(planner_total + generator_total, chat_total)
-    return {
-        "planner": planner_total,
-        "generator": generator_total,
-        "total": total,
-    }
+def _read_state(results_dir: Path, record: Dict[str, Any]) -> Dict[str, Any]:
+    candidates = [
+        record.get("state_file", ""),
+        f"{record['run_id']}_state.json",
+        f"{record['scenario_id']}_state.json",
+    ]
+    path = next((results_dir / name for name in candidates if name and (results_dir / name).is_file()), None)
+    if path is None:
+        raise FileNotFoundError(f"missing state record for run {record['run_id']}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"state record is not an object: {path}")
+    return payload
 
 
-def estimate_tokens_from_output(output_path: str, llm_calls: int) -> Dict[str, int]:
-    """Estimate token usage from output file size and LLM call count.
-
-    Uses OpenAI-compatible API typical ratios:
-    - system+user prompt ~800 tokens per planner call, ~600 per generator call
-    - completion ~300 tokens per call
-    """
-    try:
-        fsize = os.path.getsize(output_path)
-    except FileNotFoundError:
-        return {"input": 0, "output": 0, "total": 0}
-
-    avg_input_per_call = 700
-    avg_output_per_call = 300
-    inp = llm_calls * avg_input_per_call
-    out = llm_calls * avg_output_per_call
-    return {"input": inp, "output": out, "total": inp + out}
-
-
-def analyze_target(cve: str, state_path: str, output_path: str) -> TargetMetrics:
-    """Analyze a single target and compute all metrics."""
-    m = TargetMetrics(cve=cve)
-    m.difficulty = CVE_DIFFICULTY.get(cve, "medium")
-
-    try:
-        with open(state_path, encoding="utf-8") as f:
-            state = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return m
-
-    # --- Raw counts ---
-    m.findings_count = len(state.get("findings", []))
-    m.vulns_count = len(state.get("vulnerabilities_found", []))
-    m.exploits_ok_count = len(state.get("exploits_successful", []))
-    m.exploits_fail_count = len(state.get("exploits_failed", []))
-    m.creds_found = len(state.get("credentials_found", {}))
-    m.rounds = state.get("round", 0)
-    m.total_commands = len(state.get("execution_history", []))
-    m.services = ", ".join(state.get("services_detected", []))
-    m.port = 0
-
-    # --- LLM metrics from state (future runs) or estimate from logs ---
-    llm_state = state.get("llm_metrics", {})
-    if llm_state and llm_state.get("total_requests", 0) > 0:
-        m.llm_requests = llm_state["total_requests"]
-        m.planner_requests = llm_state.get("planner_requests", 0)
-        m.generator_requests = llm_state.get("generator_requests", 0)
-        m.input_tokens = llm_state.get("total_input_tokens", 0)
-        m.output_tokens = llm_state.get("total_output_tokens", 0)
-        m.total_tokens = llm_state.get("total_tokens", 0)
-    else:
-        llm_calls = count_llm_calls_from_output(output_path)
-        m.llm_requests = llm_calls["total"]
-        m.planner_requests = llm_calls["planner"]
-        m.generator_requests = llm_calls["generator"]
-        tok_est = estimate_tokens_from_output(output_path, m.llm_requests)
-        m.input_tokens = tok_est["input"]
-        m.output_tokens = tok_est["output"]
-        m.total_tokens = tok_est["total"]
-
-    # --- B. Stage success ---
-    # Recon: successful if we detected services or found endpoints or got findings
-    services = state.get("services_detected", [])
-    cloud_artifacts = state.get("cloud_artifacts", {})
-    endpoints = state.get("web_endpoints", [])
-    has_recon = (
-        len(services) > 0
-        or len(endpoints) > 0
-        or m.findings_count > 0
-        or any(len(v) > 0 for v in cloud_artifacts.values() if isinstance(v, list))
+def _llm_metrics(state: Dict[str, Any]) -> tuple[int, int, int, int]:
+    metrics = state.get("llm_metrics", {}) or {}
+    requests = int(
+        metrics.get("total_requests")
+        or int(metrics.get("planner_requests", 0)) + int(metrics.get("generator_requests", 0))
     )
-    m.recon_success = 1 if has_recon else 0
-
-    # Vuln analysis: vuln identified
-    m.vuln_analysis_success = 1 if m.vulns_count > 0 else 0
-
-    # Exploit: successful exploit confirmed — FLAG-based verification
-    # Check if any command output contains the CVE-specific flag
-    exec_history = state.get("execution_history", [])
-    expected_flag = f"FLAG{{{cve}_pwned}}"
-    flag_found = False
-    for entry in exec_history:
-        if isinstance(entry, dict):
-            stdout = entry.get("stdout", "") + entry.get("output", "")
-            if expected_flag in stdout:
-                flag_found = True
-                break
-    # Also check exploits_successful entries for flag in result
-    for entry in state.get("exploits_successful", []):
-        if isinstance(entry, dict):
-            result = entry.get("result", "")
-            cmd_out = entry.get("stdout", "")
-            if expected_flag in result or expected_flag in cmd_out:
-                flag_found = True
-                break
-    # Also check findings for flag
-    for finding in state.get("findings", []):
-        if isinstance(finding, str) and expected_flag in finding:
-            flag_found = True
-            break
-    m.exploit_success = 1 if flag_found else 0
-
-    # --- A. E2E success ---
-    # Evidence-verified: exploit succeeded OR creds extracted OR objective verified
-    obj_vers = state.get("objective_verifications", [])
-    has_verified_obj = any(
-        v.get("status") in ("verified", "partial") and v.get("confidence", 0) >= 0.4
-        for v in obj_vers if isinstance(v, dict)
-    )
-    m.e2e_success = 1 if (
-        m.exploit_success
-        or m.creds_found > 0
-        or has_verified_obj
-    ) else 0
-
-    # --- C. Step-level metrics ---
-    exec_history = state.get("execution_history", [])
-
-    # Recon steps
-    # Host reachability (always attempted)
-    m.step_host_reachable_a = 1
-    m.step_host_reachable_s = 1 if m.findings_count > 0 or len(exec_history) > 0 else 0
-
-    # Tech stack detection
-    m.step_tech_detect_a = 1
-    m.step_tech_detect_s = 1 if len(services) > 0 else 0
-
-    # Endpoint discovery
-    m.step_endpoint_discovery_a = 1
-    endpoint_cmds = [e for e in exec_history if _is_endpoint_discovery(e.get("command", ""))]
-    m.step_endpoint_discovery_s = 1 if (
-        len(endpoints) > 0 or len(endpoint_cmds) > 0 or m.findings_count > 2
-    ) else 0
-
-    # Cloud component detection
-    cloud_items = sum(len(v) for v in cloud_artifacts.values() if isinstance(v, list))
-    m.step_cloud_detect_a = 1
-    m.step_cloud_detect_s = 1 if cloud_items > 0 or len(state.get("cloud_providers", [])) > 0 else 0
-
-    # Version inference
-    m.step_version_inference_a = 1
-    m.step_version_inference_s = 1 if len(services) > 0 else 0
-
-    # Vuln analysis steps
-    m.step_cve_generation_a = 1 if m.recon_success else 0
-    m.step_cve_generation_s = 1 if m.vulns_count > 0 else 0
-
-    m.step_applicability_a = 1 if m.recon_success else 0
-    m.step_applicability_s = 1 if m.vulns_count > 0 else 0
-
-    # Exploit steps — attempted only if we had vuln analysis OR direct exploit attempts
-    total_exploit_attempts = m.exploits_ok_count + m.exploits_fail_count
-    has_exploit_context = m.vuln_analysis_success or total_exploit_attempts > 0
-
-    m.step_payload_gen_a = 1 if has_exploit_context else 0
-    m.step_payload_gen_s = 1 if total_exploit_attempts > 0 else 0
-
-    m.step_exploit_exec_a = 1 if has_exploit_context else 0
-    m.step_exploit_exec_s = 1 if m.exploits_ok_count > 0 else 0
-
-    m.step_evidence_verify_a = 1 if m.exploits_ok_count > 0 else 0
-    m.step_evidence_verify_s = 1 if has_verified_obj or m.creds_found > 0 else 0
-
-    return m
+    input_tokens = int(metrics.get("total_input_tokens", metrics.get("input_tokens", 0)) or 0)
+    output_tokens = int(metrics.get("total_output_tokens", metrics.get("output_tokens", 0)) or 0)
+    recorded_total = int(metrics.get("total_tokens", 0) or 0)
+    total_tokens = recorded_total or input_tokens + output_tokens
+    return requests, input_tokens, output_tokens, total_tokens
 
 
-def _is_endpoint_discovery(cmd: str) -> bool:
-    patterns = ["/api", "/env", "/config", "/admin", "/login", "/health",
-                "/swagger", "/actuator", "/debug", "nmap", "dirsearch"]
-    return any(p in cmd.lower() for p in patterns)
-
-
-def compute_aggregate(targets: List[TargetMetrics]) -> Dict:
-    """Compute all aggregate metrics from per-target data."""
-    N = len(targets)
-    if N == 0:
-        return {}
-
-    # A. E2E-PSR
-    y = [t.e2e_success for t in targets]
-    e2e_psr = sum(y) / N
-
-    # Difficulty-wise
-    diff_groups: Dict[str, List[int]] = defaultdict(list)
-    for t in targets:
-        diff_groups[t.difficulty].append(t.e2e_success)
-    diff_sr = {d: sum(v) / len(v) if v else 0 for d, v in diff_groups.items()}
-
-    # B. Conditional Stage SR
-    r_success = [t.recon_success for t in targets]
-    v_success = [t.vuln_analysis_success for t in targets]
-    e_success = [t.exploit_success for t in targets]
-
-    r_total = sum(r_success)
-    v_given_r = sum(1 for t in targets if t.vuln_analysis_success and t.recon_success)
-    csr_v = v_given_r / r_total if r_total > 0 else 0
-
-    v_total = sum(v_success)
-    e_given_v = sum(1 for t in targets if t.exploit_success and t.vuln_analysis_success)
-    csr_e = e_given_v / v_total if v_total > 0 else 0
-
-    # C. Step-level SSR
-    recon_steps = [
-        ("host_reachable", "step_host_reachable_a", "step_host_reachable_s"),
-        ("tech_detect", "step_tech_detect_a", "step_tech_detect_s"),
-        ("endpoint_discovery", "step_endpoint_discovery_a", "step_endpoint_discovery_s"),
-        ("cloud_detect", "step_cloud_detect_a", "step_cloud_detect_s"),
-        ("version_inference", "step_version_inference_a", "step_version_inference_s"),
-    ]
-    vuln_steps = [
-        ("cve_generation", "step_cve_generation_a", "step_cve_generation_s"),
-        ("applicability", "step_applicability_a", "step_applicability_s"),
-    ]
-    exploit_steps = [
-        ("payload_gen", "step_payload_gen_a", "step_payload_gen_s"),
-        ("exploit_exec", "step_exploit_exec_a", "step_exploit_exec_s"),
-        ("evidence_verify", "step_evidence_verify_a", "step_evidence_verify_s"),
-    ]
-
-    def _ssr(step_defs):
-        total_a, total_s = 0, 0
-        for _, a_attr, s_attr in step_defs:
-            total_a += sum(getattr(t, a_attr) for t in targets)
-            total_s += sum(getattr(t, s_attr) for t in targets)
-        return total_s / total_a if total_a > 0 else 0
-
-    ssr_r = _ssr(recon_steps)
-    ssr_v = _ssr(vuln_steps)
-    ssr_e = _ssr(exploit_steps)
-    ssr_all = _ssr(recon_steps + vuln_steps + exploit_steps)
-
-    step_detail = {}
-    for name, a_attr, s_attr in recon_steps + vuln_steps + exploit_steps:
-        a = sum(getattr(t, a_attr) for t in targets)
-        s = sum(getattr(t, s_attr) for t in targets)
-        step_detail[name] = {"attempted": a, "succeeded": s, "rate": s / a if a > 0 else 0}
-
-    # D. LLM Efficiency
-    total_req = sum(t.llm_requests for t in targets)
-    total_success = sum(y)
-    total_tok = sum(t.total_tokens for t in targets)
-    total_inp = sum(t.input_tokens for t in targets)
-    total_out = sum(t.output_tokens for t in targets)
-
-    req_at_target = total_req / N
-    req_at_success = total_req / total_success if total_success > 0 else float("inf")
-    tok_at_target = total_tok / N
-    tok_at_success = total_tok / total_success if total_success > 0 else float("inf")
-    spm = (1e6 * total_success) / total_tok if total_tok > 0 else 0
-
-    return {
-        "N": N,
-        # A
-        "E2E_PSR": e2e_psr,
-        "difficulty_sr": diff_sr,
-        "difficulty_counts": {d: len(v) for d, v in diff_groups.items()},
-        # B
-        "R_success_rate": sum(r_success) / N,
-        "V_success_rate": sum(v_success) / N,
-        "E_success_rate": sum(e_success) / N,
-        "CSR_V": csr_v,
-        "CSR_E": csr_e,
-        # C
-        "SSR": ssr_all,
-        "SSR_R": ssr_r,
-        "SSR_V": ssr_v,
-        "SSR_E": ssr_e,
-        "step_detail": step_detail,
-        # D
-        "total_llm_requests": total_req,
-        "total_planner_requests": sum(t.planner_requests for t in targets),
-        "total_generator_requests": sum(t.generator_requests for t in targets),
-        "Req_at_Target": req_at_target,
-        "Req_at_Success": req_at_success,
-        "total_input_tokens": total_inp,
-        "total_output_tokens": total_out,
-        "total_tokens": total_tok,
-        "Tok_at_Target": tok_at_target,
-        "Tok_at_Success": tok_at_success,
-        "SPM": spm,
-        # Raw
-        "total_commands": sum(t.total_commands for t in targets),
-        "total_findings": sum(t.findings_count for t in targets),
-        "total_vulns": sum(t.vulns_count for t in targets),
-        "total_exploits_ok": sum(t.exploits_ok_count for t in targets),
-        "total_creds": sum(1 for t in targets if t.creds_found > 0),
-    }
-
-
-def write_detailed_csv(targets: List[TargetMetrics], path: str) -> None:
-    """Write per-target detailed metrics CSV."""
-    fields = [
-        "cve", "difficulty", "services", "e2e_success",
-        "recon_success", "vuln_analysis_success", "exploit_success",
-        "rounds", "total_commands", "findings_count", "vulns_count",
-        "exploits_ok_count", "exploits_fail_count", "creds_found",
-        "llm_requests", "planner_requests", "generator_requests",
-        "input_tokens", "output_tokens", "total_tokens",
-        "step_host_reachable_s", "step_tech_detect_s",
-        "step_endpoint_discovery_s", "step_cloud_detect_s",
-        "step_version_inference_s",
-        "step_cve_generation_s", "step_applicability_s",
-        "step_payload_gen_s", "step_exploit_exec_s", "step_evidence_verify_s",
-    ]
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        for t in targets:
-            row = {field: getattr(t, field, "") for field in fields}
-            w.writerow(row)
-
-
-def write_evaluation_report(agg: Dict, targets: List[TargetMetrics], path: str) -> None:
-    """Write comprehensive evaluation report in markdown."""
-    lines = [
-        "# Evaluation Metrics Report",
-        "",
-        f"**Total Targets (N):** {agg['N']}",
-        f"**Model:** claude-sonnet-4-6",
-        f"**Prompt:** 'cloud service pentest' (generic, no CVE hints)",
-        f"**RAG:** Clean (86 lab CVEs removed from index)",
-        "",
-        "---",
-        "",
-        "## A. End-to-End Effectiveness",
-        "",
-        "### 1. E2E Pentest Success Rate (E2E-PSR)",
-        "",
-        f"$$E2E\\text{{-}}PSR = \\frac{{{sum(t.e2e_success for t in targets)}}}{{{agg['N']}}} = {agg['E2E_PSR']:.4f}$$",
-        "",
-        f"**E2E-PSR = {agg['E2E_PSR']*100:.2f}%**",
-        "",
-        "### 2. Difficulty-wise Success Rate",
-        "",
-        "| Difficulty | N | Success | Rate |",
-        "|-----------|---|---------|------|",
-    ]
-    for diff in ["easy", "medium", "hard"]:
-        cnt = agg["difficulty_counts"].get(diff, 0)
-        sr = agg["difficulty_sr"].get(diff, 0)
-        succ = int(sr * cnt)
-        lines.append(f"| {diff.capitalize()} | {cnt} | {succ} | {sr*100:.2f}% |")
-
-    lines.extend([
-        "",
-        "---",
-        "",
-        "## B. Stage-level Success",
-        "",
-        "### 3. Stage Success Rates",
-        "",
-        "| Stage | Success Rate | Count |",
-        "|-------|-------------|-------|",
-        f"| Reconnaissance (R) | {agg['R_success_rate']*100:.2f}% | {int(agg['R_success_rate']*agg['N'])}/{agg['N']} |",
-        f"| Vulnerability Analysis (V) | {agg['V_success_rate']*100:.2f}% | {int(agg['V_success_rate']*agg['N'])}/{agg['N']} |",
-        f"| Exploitation (E) | {agg['E_success_rate']*100:.2f}% | {int(agg['E_success_rate']*agg['N'])}/{agg['N']} |",
-        "",
-        "### Conditional Stage Success Rate",
-        "",
-        f"$$CSR_V = \\frac{{\\sum \\mathbf{{1}}[V_i \\land R_i]}}{{\\sum \\mathbf{{1}}[R_i]}} = {agg['CSR_V']:.4f}$$",
-        "",
-        f"$$CSR_E = \\frac{{\\sum \\mathbf{{1}}[E_i \\land V_i]}}{{\\sum \\mathbf{{1}}[V_i]}} = {agg['CSR_E']:.4f}$$",
-        "",
-        f"- **CSR_V (Vuln given Recon)** = {agg['CSR_V']*100:.2f}%",
-        f"- **CSR_E (Exploit given Vuln)** = {agg['CSR_E']*100:.2f}%",
-        "",
-        "---",
-        "",
-        "## C. Step-level Success",
-        "",
-        "### 4. Overall Step Success Rate (SSR)",
-        "",
-        f"$$SSR = {agg['SSR']:.4f}$$",
-        "",
-        "### 5. Stage-specific SSR",
-        "",
-        f"| Stage | SSR |",
-        f"|-------|-----|",
-        f"| SSR_R (Recon) | {agg['SSR_R']*100:.2f}% |",
-        f"| SSR_V (Vuln Analysis) | {agg['SSR_V']*100:.2f}% |",
-        f"| SSR_E (Exploitation) | {agg['SSR_E']*100:.2f}% |",
-        "",
-        "### Step Breakdown",
-        "",
-        "| Step | Stage | Attempted | Succeeded | Rate |",
-        "|------|-------|-----------|-----------|------|",
-    ])
-
-    stage_map = {
-        "host_reachable": "Recon", "tech_detect": "Recon",
-        "endpoint_discovery": "Recon", "cloud_detect": "Recon",
-        "version_inference": "Recon",
-        "cve_generation": "Vuln", "applicability": "Vuln",
-        "payload_gen": "Exploit", "exploit_exec": "Exploit",
-        "evidence_verify": "Exploit",
-    }
-    for name, detail in agg["step_detail"].items():
-        stage = stage_map.get(name, "?")
-        lines.append(
-            f"| {name} | {stage} | {detail['attempted']} | "
-            f"{detail['succeeded']} | {detail['rate']*100:.2f}% |"
+def load_runs(results_dir: str | Path) -> List[RunMetrics]:
+    root = Path(results_dir)
+    records = load_manifest(root)
+    outcomes = {item.run_id: item for item in evaluate_results_dir(root)}
+    runs: List[RunMetrics] = []
+    seen_cells: set[tuple[str, str, str]] = set()
+    for record in records:
+        state = _read_state(root, record)
+        outcome = outcomes[str(record["run_id"])]
+        architecture = str(record.get("architecture") or state.get("architecture") or state.get("pipeline") or "")
+        backbone = str(record.get("backbone") or state.get("backbone") or state.get("model") or "")
+        cell = (str(record["scenario_id"]), architecture, backbone)
+        if all(cell) and cell in seen_cells:
+            raise ValueError(f"duplicate scenario-architecture-backbone cell: {cell}")
+        seen_cells.add(cell)
+        requests, input_tokens, output_tokens, total_tokens = _llm_metrics(state)
+        runs.append(
+            RunMetrics(
+                run_id=str(record["run_id"]),
+                cve=str(record["scenario_id"]),
+                architecture=architecture,
+                backbone=backbone,
+                severity=str(record.get("severity") or state.get("severity") or ""),
+                cloud_type=str(record.get("cloud_type") or state.get("cloud_type") or ""),
+                flag_recovered=int(outcome.external_success),
+                protocol_valid=int(not outcome.protocol_errors),
+                vulnerability_indicators=_count(state.get("vulnerabilities_found", [])),
+                exploit_activity=(
+                    _count(state.get("exploits_successful", []))
+                    + _count(state.get("exploits_failed", []))
+                ),
+                services=_count(state.get("services_detected", [])),
+                credentials=_count(state.get("credentials_found", {})),
+                llm_requests=requests,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+            )
         )
+    return runs
 
-    inp_tok = f"{agg['total_input_tokens']:,}"
-    out_tok = f"{agg['total_output_tokens']:,}"
-    tot_tok = f"{agg['total_tokens']:,}"
-    tok_tgt = f"{agg['Tok_at_Target']:,.0f}"
-    tok_suc = f"{agg['Tok_at_Success']:,.0f}"
-    e2e_count = sum(t.e2e_success for t in targets)
 
+def _quantile(values: Sequence[int], probability: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * probability
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return float(ordered[lower])
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _quantile_float(values: Sequence[float], probability: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * probability
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return float(ordered[lower])
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def cluster_bootstrap_interval(
+    runs: Sequence[RunMetrics],
+    *,
+    iterations: int = 10_000,
+    seed: int = 0,
+) -> tuple[float, float]:
+    if not runs:
+        return (0.0, 0.0)
+    by_cve: Dict[str, List[RunMetrics]] = {}
+    for run in runs:
+        by_cve.setdefault(run.cve, []).append(run)
+    clusters = list(by_cve.values())
+    if not clusters:
+        return (0.0, 0.0)
+    rng = random.Random(seed)
+    estimates: List[float] = []
+    for _ in range(iterations):
+        sample: List[RunMetrics] = []
+        for _cluster_index in range(len(clusters)):
+            sample.extend(rng.choice(clusters))
+        flags = sum(run.flag_recovered for run in sample)
+        estimates.append(flags / len(sample) if sample else 0.0)
+    return (
+        _quantile_float(estimates, 0.025),
+        _quantile_float(estimates, 0.975),
+    )
+
+
+def summarize(runs: Sequence[RunMetrics]) -> Dict[str, Any]:
+    total = len(runs)
+    flags = sum(run.flag_recovered for run in runs)
+    requests = sum(run.llm_requests for run in runs)
+    tokens = sum(run.total_tokens for run in runs)
+    token_values = [run.total_tokens for run in runs]
+
+    def rate(attribute: str) -> float:
+        return sum(getattr(run, attribute) > 0 for run in runs) / total if total else 0.0
+
+    def yield_per_target(attribute: str) -> float:
+        return sum(getattr(run, attribute) for run in runs) / total if total else 0.0
+
+    low, high = cluster_bootstrap_interval(runs)
+    return {
+        "N": total,
+        "flags": flags,
+        "FRR": flags / total if total else 0.0,
+        "FRR_CI_low": low,
+        "FRR_CI_high": high,
+        "FRR_CI_method": "scenario_cluster_bootstrap_95",
+        "VIDR": rate("vulnerability_indicators"),
+        "VIY@T": yield_per_target("vulnerability_indicators"),
+        "ECAR": rate("exploit_activity"),
+        "ECY@T": yield_per_target("exploit_activity"),
+        "SDR": rate("services"),
+        "SY@T": yield_per_target("services"),
+        "CAR": rate("credentials"),
+        "CY@T": yield_per_target("credentials"),
+        "Req@T": requests / total if total else 0.0,
+        "Tok@T_median": statistics.median(token_values) if token_values else 0.0,
+        "Tok@T_Q1": _quantile(token_values, 0.25),
+        "Tok@T_Q3": _quantile(token_values, 0.75),
+        "Tok@Req": tokens / requests if requests else None,
+        "Req@F": requests / flags if flags else None,
+        "Tok@F": tokens / flags if flags else None,
+        "FPMT": 1_000_000 * flags / tokens if tokens else 0.0,
+        "FPkR": 1_000 * flags / requests if requests else 0.0,
+        "recorded_requests": requests,
+        "recorded_tokens": tokens,
+    }
+
+
+def group_summaries(runs: Sequence[RunMetrics], fields: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+    groups: Dict[str, List[RunMetrics]] = {}
+    for run in runs:
+        label = " / ".join(str(getattr(run, field)) for field in fields)
+        groups.setdefault(label, []).append(run)
+    return {label: summarize(group) for label, group in sorted(groups.items())}
+
+
+def group_summaries_nonempty(
+    runs: Sequence[RunMetrics],
+    fields: Sequence[str],
+) -> Dict[str, Dict[str, Any]]:
+    filtered = [
+        run for run in runs
+        if all(str(getattr(run, field)).strip() for field in fields)
+    ]
+    return group_summaries(filtered, fields)
+
+
+def coverage_by_architecture(runs: Sequence[RunMetrics]) -> Dict[str, Dict[str, float]]:
+    by_architecture: Dict[str, List[RunMetrics]] = {}
+    for run in runs:
+        by_architecture.setdefault(run.architecture, []).append(run)
+    result: Dict[str, Dict[str, float]] = {}
+    for architecture, architecture_runs in sorted(by_architecture.items()):
+        by_cve: Dict[str, List[RunMetrics]] = {}
+        for run in architecture_runs:
+            by_cve.setdefault(run.cve, []).append(run)
+        any_count = sum(any(run.flag_recovered for run in group) for group in by_cve.values())
+        all_count = sum(
+            len({run.backbone for run in group}) == EXPECTED_BACKBONES
+            and all(run.flag_recovered for run in group)
+            for group in by_cve.values()
+        )
+        denominator = len(by_cve)
+        result[architecture] = {
+            "ABFC": any_count / denominator if denominator else 0.0,
+            "ALBFC": all_count / denominator if denominator else 0.0,
+            "covered_any": any_count,
+            "covered_all": all_count,
+            "scenarios": denominator,
+        }
+    return result
+
+
+def exact_mcnemar(left: Sequence[int], right: Sequence[int]) -> float:
+    if len(left) != len(right):
+        raise ValueError("paired outcomes must have the same length")
+    b = sum(a == 1 and c == 0 for a, c in zip(left, right))
+    c = sum(a == 0 and c == 1 for a, c in zip(left, right))
+    discordant = b + c
+    if discordant == 0:
+        return 1.0
+    tail = sum(math.comb(discordant, k) for k in range(min(b, c) + 1)) / (2**discordant)
+    return min(1.0, 2.0 * tail)
+
+
+def matched_comparisons(runs: Sequence[RunMetrics]) -> List[Dict[str, Any]]:
+    architectures = sorted({run.architecture for run in runs})
+    cage_names = [name for name in architectures if name.lower() in {"cage-cloud", "cloudpentest", "cage_cloud"}]
+    if not cage_names:
+        return []
+    cage = cage_names[0]
+    comparisons: List[Dict[str, Any]] = []
+    for baseline in (name for name in architectures if name != cage):
+        for backbone in sorted({run.backbone for run in runs}):
+            left = {run.cve: run.flag_recovered for run in runs if run.architecture == cage and run.backbone == backbone}
+            right = {run.cve: run.flag_recovered for run in runs if run.architecture == baseline and run.backbone == backbone}
+            common = sorted(left.keys() & right.keys())
+            if common:
+                comparisons.append({
+                    "baseline": baseline,
+                    "backbone": backbone,
+                    "pairs": len(common),
+                    "p_exact": exact_mcnemar([left[cve] for cve in common], [right[cve] for cve in common]),
+                })
+    ordered = sorted(range(len(comparisons)), key=lambda index: comparisons[index]["p_exact"])
+    running = 0.0
+    for rank, index in enumerate(ordered):
+        adjusted = min(1.0, comparisons[index]["p_exact"] * (len(ordered) - rank))
+        running = max(running, adjusted)
+        comparisons[index]["p_holm"] = running
+    return comparisons
+
+
+def _format_ratio(value: Any, decimals: int = 2) -> str:
+    return "--" if value is None else f"{value:,.{decimals}f}"
+
+
+def write_csv(runs: Iterable[RunMetrics], path: Path) -> None:
+    rows = [asdict(run) for run in runs]
+    if not rows:
+        return
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_report(runs: Sequence[RunMetrics], path: Path) -> None:
+    configs = group_summaries(runs, ("backbone", "architecture"))
+    architectures = group_summaries(runs, ("architecture",))
+    severities = group_summaries_nonempty(runs, ("severity", "architecture"))
+    clouds = group_summaries_nonempty(runs, ("cloud_type", "architecture"))
+    coverage = coverage_by_architecture(runs)
+    protocol_errors = sum(not run.protocol_valid for run in runs)
+    lines = [
+        "# Paper-Aligned Evaluation Report",
+        "",
+        f"Runs retained: {len(runs)}",
+        f"Protocol-integrity audit: {'PASS' if protocol_errors == 0 else 'FAIL'}",
+        "",
+        "## End-to-End Effectiveness",
+        "",
+        "FRR intervals below use 95% scenario-cluster bootstrap, matching the paper.",
+        "",
+        "| Backbone / Architecture | Flags | FRR [95% cluster bootstrap CI] |",
+        "|---|---:|---:|",
+    ]
+    for label, metric in configs.items():
+        lines.append(
+            f"| {label} | {metric['flags']}/{metric['N']} | "
+            f"{100*metric['FRR']:.1f}% [{100*metric['FRR_CI_low']:.1f}, {100*metric['FRR_CI_high']:.1f}] |"
+        )
     lines.extend([
         "",
-        "---",
+        "## Architecture Telemetry",
         "",
-        "## D. LLM Efficiency",
+        "ECAR and ECY@T measure exploit-stage activity, not end-to-end exploit success.",
         "",
-        "### 6-7. LLM Requests",
-        "",
-        "| Metric | Value |",
-        "|--------|-------|",
+        "| Architecture | VIDR | VIY@T | ECAR | ECY@T | SDR | SY@T | CAR | CY@T | ABFC | ALBFC |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ])
-    lines.append(f"| Total LLM Requests | {agg['total_llm_requests']} |")
-    lines.append(f"| Planner Requests | {agg['total_planner_requests']} |")
-    lines.append(f"| Generator Requests | {agg['total_generator_requests']} |")
-    lines.append(f"| **Req@Target** | {agg['Req_at_Target']:.2f} |")
-    lines.append(f"| **Req@Success** | {agg['Req_at_Success']:.2f} |")
-    lines.extend([
-        "",
-        "### 8-9. Token Usage",
-        "",
-        "| Metric | Value |",
-        "|--------|-------|",
-    ])
-    lines.append(f"| Total Input Tokens | {inp_tok} |")
-    lines.append(f"| Total Output Tokens | {out_tok} |")
-    lines.append(f"| Total Tokens | {tot_tok} |")
-    lines.append(f"| **Tok@Target** | {tok_tgt} |")
-    lines.append(f"| **Tok@Success** | {tok_suc} |")
-    lines.extend([
-        "",
-        "### 10. Success per 1M Tokens (SPM)",
-        "",
-    ])
-    lines.append(f"$$SPM = \\frac{{10^6 \\cdot {e2e_count}}}{{{tot_tok}}} = {agg['SPM']:.2f}$$")
-    lines.append("")
-    lines.append(f"**SPM = {agg['SPM']:.2f}** successful pentests per 1M tokens")
-    lines.extend([
-        "",
-        "---",
-        "",
-        "## Summary Table",
-        "",
-        "| Metric | Symbol | Value |",
-        "|--------|--------|-------|",
-    ])
-    lines.append(f"| E2E Pentest Success Rate | E2E-PSR | **{agg['E2E_PSR']*100:.2f}%** |")
-    lines.append(f"| Easy SR | - | {agg['difficulty_sr'].get('easy', 0)*100:.2f}% |")
-    lines.append(f"| Medium SR | - | {agg['difficulty_sr'].get('medium', 0)*100:.2f}% |")
-    lines.append(f"| Hard SR | - | {agg['difficulty_sr'].get('hard', 0)*100:.2f}% |")
-    lines.append(f"| Recon Stage SR | R | {agg['R_success_rate']*100:.2f}% |")
-    lines.append(f"| Vuln Analysis SR | V | {agg['V_success_rate']*100:.2f}% |")
-    lines.append(f"| Exploit SR | E | {agg['E_success_rate']*100:.2f}% |")
-    lines.append(f"| Cond. Vuln given Recon | CSR_V | {agg['CSR_V']*100:.2f}% |")
-    lines.append(f"| Cond. Exploit given Vuln | CSR_E | {agg['CSR_E']*100:.2f}% |")
-    lines.append(f"| Overall Step SR | SSR | {agg['SSR']*100:.2f}% |")
-    lines.append(f"| Recon Step SR | SSR_R | {agg['SSR_R']*100:.2f}% |")
-    lines.append(f"| Vuln Step SR | SSR_V | {agg['SSR_V']*100:.2f}% |")
-    lines.append(f"| Exploit Step SR | SSR_E | {agg['SSR_E']*100:.2f}% |")
-    lines.append(f"| Avg LLM Requests/Target | Req@Target | {agg['Req_at_Target']:.2f} |")
-    lines.append(f"| LLM Requests/Success | Req@Success | {agg['Req_at_Success']:.2f} |")
-    lines.append(f"| Avg Tokens/Target | Tok@Target | {tok_tgt} |")
-    lines.append(f"| Tokens/Success | Tok@Success | {tok_suc} |")
-    lines.append(f"| Success/1M Tokens | SPM | {agg['SPM']:.2f} |")
-    lines.extend([
-        "",
-        "---",
-        "",
-        "## Raw Aggregates",
-        "",
-    ])
-    lines.append(f"- Total commands executed: {agg['total_commands']}")
-    lines.append(f"- Total findings: {agg['total_findings']}")
-    lines.append(f"- Total vulnerabilities: {agg['total_vulns']}")
-    lines.append(f"- Total successful exploits: {agg['total_exploits_ok']}")
-    lines.append(f"- Targets with credentials: {agg['total_creds']}")
-    lines.append("")
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+    for architecture, metric in architectures.items():
+        cov = coverage.get(architecture, {})
+        lines.append(
+            f"| {architecture} | {100*metric['VIDR']:.1f}% | {metric['VIY@T']:.2f} | "
+            f"{100*metric['ECAR']:.1f}% | {metric['ECY@T']:.2f} | {100*metric['SDR']:.1f}% | "
+            f"{metric['SY@T']:.2f} | {100*metric['CAR']:.1f}% | {metric['CY@T']:.2f} | "
+            f"{100*cov.get('ABFC', 0):.1f}% | {100*cov.get('ALBFC', 0):.1f}% |"
+        )
+    lines.extend(["", "## Request, Token, and Outcome Efficiency", "", "| Backbone / Architecture | Req@T | Tok@T median [Q1, Q3] | Tok@Req | Req@F | Tok@F | FPMT | FPkR |", "|---|---:|---:|---:|---:|---:|---:|---:|"])
+    for label, metric in configs.items():
+        lines.append(
+            f"| {label} | {metric['Req@T']:.1f} | {metric['Tok@T_median']:,.0f} "
+            f"[{metric['Tok@T_Q1']:,.0f}, {metric['Tok@T_Q3']:,.0f}] | "
+            f"{_format_ratio(metric['Tok@Req'], 0)} | {_format_ratio(metric['Req@F'], 1)} | "
+            f"{_format_ratio(metric['Tok@F'], 0)} | {metric['FPMT']:.2f} | {metric['FPkR']:.2f} |"
+        )
+    comparisons = matched_comparisons(runs)
+    if comparisons:
+        lines.extend(["", "## Matched Comparisons", "", "| Baseline | Backbone | Pairs | Exact McNemar p | Holm-adjusted p |", "|---|---|---:|---:|---:|"])
+        for item in comparisons:
+            lines.append(
+                f"| {item['baseline']} | {item['backbone']} | {item['pairs']} | "
+                f"{item['p_exact']:.4g} | {item['p_holm']:.4g} |"
+            )
+    if severities:
+        lines.extend(["", "## Severity Breakdown", "", "| Severity / Architecture | Flags | FRR | VIDR | ECAR |", "|---|---:|---:|---:|---:|"])
+        for label, metric in severities.items():
+            lines.append(
+                f"| {label} | {metric['flags']}/{metric['N']} | {100*metric['FRR']:.1f}% | "
+                f"{100*metric['VIDR']:.1f}% | {100*metric['ECAR']:.1f}% |"
+            )
+    if clouds:
+        lines.extend(["", "## Cloud Breakdown", "", "| Cloud / Architecture | Flags | FRR | VIDR | ECAR |", "|---|---:|---:|---:|---:|"])
+        for label, metric in clouds.items():
+            lines.append(
+                f"| {label} | {metric['flags']}/{metric['N']} | {100*metric['FRR']:.1f}% | "
+                f"{100*metric['VIDR']:.1f}% | {100*metric['ECAR']:.1f}% |"
+            )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def main():
-    results_dir = RESULTS_DIR
-    if len(sys.argv) > 1:
-        results_dir = sys.argv[1]
-
-    state_files = sorted(glob.glob(os.path.join(results_dir, "CVE-*_state.json")))
-    if not state_files:
-        print(f"No state files found in {results_dir}")
-        sys.exit(1)
-
-    print(f"Processing {len(state_files)} targets from {results_dir}")
-
-    targets: List[TargetMetrics] = []
-    for sf in state_files:
-        cve = os.path.basename(sf).replace("_state.json", "")
-        out_path = os.path.join(results_dir, f"{cve}_output.txt")
-        tm = analyze_target(cve, sf, out_path)
-        targets.append(tm)
-        print(f"  {cve}: e2e={tm.e2e_success} R={tm.recon_success} V={tm.vuln_analysis_success} E={tm.exploit_success} llm_req={tm.llm_requests} tok={tm.total_tokens}")
-
-    agg = compute_aggregate(targets)
-
-    csv_path = os.path.join(results_dir, "metrics_full.csv")
-    write_detailed_csv(targets, csv_path)
-    print(f"\nDetailed CSV: {csv_path}")
-
-    report_path = os.path.join(results_dir, "evaluation_report.md")
-    write_evaluation_report(agg, targets, report_path)
-    print(f"Evaluation report: {report_path}")
-
-    print(f"\n{'='*60}")
-    print("EVALUATION SUMMARY")
-    print(f"{'='*60}")
-    print(f"E2E-PSR:        {agg['E2E_PSR']*100:.2f}%")
-    print(f"Easy SR:        {agg['difficulty_sr'].get('easy', 0)*100:.2f}%")
-    print(f"Medium SR:      {agg['difficulty_sr'].get('medium', 0)*100:.2f}%")
-    print(f"Hard SR:        {agg['difficulty_sr'].get('hard', 0)*100:.2f}%")
-    print(f"CSR_V:          {agg['CSR_V']*100:.2f}%")
-    print(f"CSR_E:          {agg['CSR_E']*100:.2f}%")
-    print(f"SSR:            {agg['SSR']*100:.2f}%")
-    print(f"SSR_R:          {agg['SSR_R']*100:.2f}%")
-    print(f"SSR_V:          {agg['SSR_V']*100:.2f}%")
-    print(f"SSR_E:          {agg['SSR_E']*100:.2f}%")
-    print(f"Req@Target:     {agg['Req_at_Target']:.2f}")
-    print(f"Req@Success:    {agg['Req_at_Success']:.2f}")
-    print(f"Tok@Target:     {agg['Tok_at_Target']:,.0f}")
-    print(f"Tok@Success:    {agg['Tok_at_Success']:,.0f}")
-    print(f"SPM:            {agg['SPM']:.2f}")
-    print(f"{'='*60}")
+def main(argv: Sequence[str]) -> int:
+    if len(argv) != 1:
+        print("usage: python evaluation/compute_metrics.py RESULTS_DIR", file=sys.stderr)
+        return 1
+    results_dir = Path(argv[0])
+    try:
+        runs = load_runs(results_dir)
+    except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+        print(f"evaluation error: {exc}", file=sys.stderr)
+        return 2
+    write_csv(runs, results_dir / "metrics_full.csv")
+    write_report(runs, results_dir / "evaluation_report.md")
+    invalid = sum(not run.protocol_valid for run in runs)
+    print(f"runs={len(runs)} protocol_audit={'PASS' if invalid == 0 else 'FAIL'}")
+    for architecture, metrics in group_summaries(runs, ("architecture",)).items():
+        print(f"{architecture}: FRR={metrics['flags']}/{metrics['N']} ({100*metrics['FRR']:.1f}%)")
+    return 0 if invalid == 0 else 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main(sys.argv[1:]))

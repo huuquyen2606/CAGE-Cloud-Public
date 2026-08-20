@@ -1,213 +1,169 @@
 # CAGE-Cloud
 
-**Structured-State and Evidence-Grounded Autonomous Penetration Testing for Cloud Environments**
+**Evidence-Grounded Autonomous Cloud Penetration Testing with Authoritative Structured State**
 
-CAGE-Cloud is an autonomous cloud penetration-testing framework that separates
-*language-model reasoning* from *deterministic execution-state handling*. Instead
-of driving a single LLM over flat conversation history, CAGE-Cloud maintains a
-normalised runner state and a **typed evidence graph**, uses **deterministic
-parsers and an objective-level verifier** to ground findings in real execution
-evidence, and applies **skill routing with stagnation-aware stopping** to bound
-unproductive exploration.
+CAGE-Cloud is an autonomous cloud-oriented penetration-testing framework in
+which a persistent normalized runner state is the operational authority. A
+Typed Agentic Evidence Graph is materialized from committed state to provide
+bounded relational context; it is not an independent source of truth. LLM
+components propose tasks and commands, while controlled execution,
+provider-aware artifact processing, and 17 deterministic objective handlers
+decide whether evidence is `verified`, `partial`, or `unverified`.
 
-This repository contains the framework code, the two re-implemented baseline
-architectures used for comparison, the flag oracle for the cloud-CVE testbed,
-and the metrics tooling — i.e. the code accompanying the paper.
-
----
-
-## Core ideas
-
-1. **Structured state via a typed evidence graph.** Discovered services,
-   endpoints, credentials, CVE candidates, vulnerabilities and evidence are
-   represented as typed nodes/edges. Each round the graph is distilled into a
-   bounded summary (`≤ 120` nodes, `≤ 220` edges) that becomes the Planner's
-   primary state input, replacing the opaque chat transcript with an auditable
-   state object.
-2. **Fully autonomous operation.** Planning, execution, output interpretation and
-   stopping are handled end-to-end with no human in the loop: an LLM plans and
-   synthesises commands, deterministic rule-based parsers interpret every output,
-   a rule-based verifier assigns a per-objective status, and a deterministic
-   stopping rule (no-progress counter, flag capture, or round budget) ends the run.
-3. **Cost-efficient local planning via fine-tuning.** A Planner-only few-shot
-   QLoRA pipeline adapts open-weight 27–32B backbones (Gemma2-27B, Qwen2.5-32B)
-   to parity with commercial APIs at a fraction of the per-target token cost.
-4. **A reproducible evaluation testbed.** A Docker-based set of 86 cloud-CVE labs,
-   each instrumented with a synthetic `FLAG{<cve-id>_pwned}` oracle, enabling
-   strict, reproducible measurement of end-to-end exploitation.
-
----
+This repository contains the framework, adapted PentestAgent-style and
+VulnBot-style comparison pipelines, the external flag protocol, and evaluation
+code accompanying the paper. It is intended only for authorized, isolated
+laboratories.
 
 ## Architecture
 
-CAGE-Cloud is organised as a runner-state-driven loop over six components:
+At round `t`, the runner performs the paper's execution-to-state transition:
 
-![CAGE-Cloud high-level runtime flow](docs/figures/architecture.png)
-
-At each round `t` the runner reconstructs a bounded, typed **graph summary** from
-the current state, the **Skill Router** selects a skill family plus few-shot
-exemplars, and the **Planner** (the only strategic LLM) emits a typed task list.
-The **Generator** turns each task into one concrete command; the **Executor**
-runs it in a subprocess under timeout limits; the **Cloud-native Extractor** and
-the deterministic **parser** turn raw output into typed artefacts; and the
-**Evidence Verifier** assigns each objective a status in
-`{verified, partial, unverified}`. The **Graph Manager** folds artefacts and
-verification records back into the next state. The LLM never interprets raw
-`stdout`/`stderr` — this is the design choice that removes hallucinated
-verification.
-
----
-
-## Repository layout
-
+```text
+state -> materialized graph -> bounded summary -> skill routing -> planning
+      -> command generation -> controlled execution -> typed evidence
+      -> artifact extraction -> objective verification -> committed state
 ```
-cage_cloud/                 # the framework
-├── schema.py               # typed schema: ObjectiveType, ActionProposal,
-│                           #   GraphNode/GraphEdge, VerificationStatus, BudgetSnapshot
-├── graph.py                # Agentic Evidence Graph (GraphState, build_graph_lite_state)
-├── skill_router.py         # deterministic Skill Router + few-shot exemplar retriever
-├── verifier.py             # rule-based Evidence Verifier (17 objective types)
-├── scope_guard.py          # ScopeGuard policy module (net / command / budget policies)
-├── orchestrator.py         # the Planner→Generator→Executor→Extractor→Verifier loop
-│                           #   (RealExecutor, OutputParser, VULN_PATTERNS, AIClient)
-├── rag/
-│   ├── integration.py      # retrieval-augmented CVE-knowledge recall for the Planner
-│   └── search.py           # embedding/keyword search backend over CVE documents
-└── fewshot/
-    └── planner_examples.json   # in-context exemplar bank used by the Skill Router
 
-baselines/                  # faithful re-implementations used for comparison
-├── vulnbot.py              # VulnBot-style sequential multi-agent baseline (B1)
-└── pentestagent.py         # PentestAgent-style hierarchical RAG baseline (B2)
+The implementation includes:
 
+- 11 graph node types and 13 directed relation types;
+- eight deterministic skill families and an 18-example context bank;
+- at most two contextual examples per planning round, ranked by
+  `10*skill_match + 4*provider_match + 2*stack_match`;
+- 17 objective-specific evidence handlers;
+- a Planner-facing graph bound of 120 nodes and 220 edges; and
+- early stopping after three completed rounds with an unchanged canonical
+  committed-progress signature.
+
+Only verified findings are confirmed planning preconditions. Partial and
+unverified observations may remain in the trace with provenance, but do not
+establish objective completion.
+
+## Repository Layout
+
+```text
+cage_cloud/
+  schema.py                typed action, evidence, graph, and verifier records
+  graph.py                 state-derived graph and canonical progress signature
+  skill_router.py          eight-family router and contextual-example retrieval
+  verifier.py              17 deterministic objective handlers
+  scope_guard.py           target, command, and budget checks
+  orchestrator.py          Planner-to-commit execution loop
+  rag/                     optional CVE-context retrieval
+  fewshot/                 18 contextual Planner examples
+baselines/
+  pentestagent.py          adapted PentestAgent-style pipeline
+  vulnbot.py               adapted VulnBot-style pipeline
 testbed/
-├── cve_flags.json          # per-CVE flag oracle tokens (FLAG{<cve-id>_pwned})
-├── inject_flags.py         # injects flags into the Docker CVE labs
-└── flag_oracle.py          # strict flag-capture evaluator (grep token in raw output)
-
+  flag_issuer.py           run-specific HMAC flag issuance (paper Eq. 26)
+  provision.py             control-plane manifest and target environment setup
+  target_event.py          target-side Eq. 27 provenance event writer
+  flag_oracle.py           common external outcome evaluator (paper Eq. 27)
 evaluation/
-└── compute_metrics.py      # aggregates ECR, FCR, Req@T/S, Tok@T/S, SPM
+  compute_metrics.py       FRR, consistency, telemetry, and efficiency metrics
 ```
-
----
 
 ## Installation
 
 ```bash
-git clone https://github.com/huuquyen2606/CAGE-Cloud-Public.git
+git clone https://github.com/TuanHung1149/CAGE-Cloud-Public.git
 cd CAGE-Cloud-Public
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Only `requests` is required for the core pipeline and baselines. The
-retrieval-augmented recall module (`cage_cloud.rag`) additionally needs
-`numpy`, `torch`, `transformers` and `faiss-cpu` (commented in
-`requirements.txt`); the pipeline degrades gracefully to keyword recall when
-these are absent.
-
-The Planner and Generator are served by any **OpenAI-compatible chat-completions
-endpoint** (a hosted API, or a local server such as Ollama/vLLM). Configure it
-through environment variables or CLI flags — no keys are hard-coded.
+Planner and Generator calls use an OpenAI-compatible chat-completions endpoint.
+API keys are supplied at runtime and must not be committed.
 
 ```bash
-export API_URL="http://localhost:8000/v1"   # your OpenAI-compatible endpoint
-export API_KEY="..."                        # if your endpoint requires one
-```
+export API_URL="http://localhost:8000/v1"
+export API_KEY="..."
 
----
-
-## Usage
-
-### 1. Run CAGE-Cloud against a target
-
-```bash
 python -m cage_cloud.orchestrator \
-    --api-url "$API_URL" --api-key "$API_KEY" \
-    --target-url "http://localhost:8080" \
-    --target "cloud service pentest" \
-    --max-rounds 5
+  --api-url "$API_URL" \
+  --api-key "$API_KEY" \
+  --target-url "http://localhost:8080" \
+  --target "authorized cloud security laboratory" \
+  --max-rounds 15
 ```
 
-Cloud credentials for authenticated enumeration can be supplied through the
-`--aws-*`, `--azure-*` and `--gcp-*` flags (synthetic lab credentials only —
-see *Responsible use*). Each run writes `<name>_state.json`, `<name>_exec.json`
-and `<name>_report.md`.
+## External Outcome Protocol
 
-### 2. Run a baseline (same Executor, different memory/verification)
+Each architecture-backbone-scenario run receives a fresh protected flag:
+
+```text
+phi(i,r) = FLAG{ Hex[ HMAC(k_i, run_id || nonce) ] }
+```
+
+`k_i`, the expected flag, and validation metadata remain in the evaluation
+control plane. The assessed pipeline receives none of them. When the protected
+condition is satisfied, the target writes a `target_events.jsonl` event with the
+run ID, scenario ID, security-condition ID, timestamp, flag digest, and
+`condition_satisfied: true`.
+
+The oracle reports a positive outcome only when all conditions in paper Eq. 27
+hold:
+
+1. the exact run-specific flag occurs in retained execution observations;
+2. a matching target-side issuance event exists; and
+3. the scenario-defined security condition is confirmed.
 
 ```bash
-python -m baselines.vulnbot      --target-url "http://localhost:8080"
-python -m baselines.pentestagent --target-url "http://localhost:8080"
+python -m testbed.provision \
+  --cve-list cves.txt \
+  --results-dir results/cage-qwen-base \
+  --architecture CAGE-Cloud \
+  --backbone Qwen2.5-32B-base
+
+python -m testbed.flag_oracle results/cage-qwen-base
+python evaluation/compute_metrics.py results/cage-qwen-base
 ```
 
-### 3. Score exploitation with the strict flag oracle
+The manifest and target events are evaluation-control artifacts and are ignored
+by Git.
 
-```bash
-python -m testbed.flag_oracle path/to/results_dir [more_dirs ...]
-# e.g. -> results_dir: 9/86 flags (10.5%)
-```
+## Metrics
 
-### 4. Aggregate metrics
+The primary outcome is **Flag Recovery Rate (FRR)**. ECAR and VIDR are
+operational telemetry, not exploitation-success measures. `Tok@T` is reported
+as median `[Q1, Q3]`; `Tok@Req`, `Req@F`, `Tok@F`, FPMT, and FPkR are pooled
+ratios.
 
-```bash
-python evaluation/compute_metrics.py    # ECR, FCR, Req@T/S, Tok@T/S, SPM
-```
+The paper evaluates 86 validated Docker scenarios under three architectures and
+six LLM configurations, for 1,548 runs. CAGE-Cloud recovers 53 flags in its 516
+runs (FRR 10.3%; CVE-cluster bootstrap 95% interval 4.7-16.9%). The adapted
+PentestAgent-style and VulnBot-style pipelines each recover 0/516 flags. These
+numbers apply only to the paper's controlled protocol and do not imply a general
+CVE exploitation rate.
 
----
+## Reproducibility Scope
 
-## Testbed and flag oracle
+The public repository intentionally excludes control-plane secrets, expected
+flags, raw execution traces, model weights, and other sensitive/generated
+artifacts. The 328-record Planner-specialization corpus and the full validated
+scenario archive are versioned separately in the research release. Their absence
+from this repository must not be interpreted as a claim that the complete 1,548
+run experiment can be reproduced from this checkout alone.
 
-The evaluation uses **86 held-out Docker CVE labs** that reproduce cloud-facing
-attack surfaces (exposed metadata, leaked credentials, misconfigured storage,
-vulnerable services, …). Each lab embeds a unique secret token
-`FLAG{<cve-id>_pwned}` reachable only upon successful end-to-end exploitation of
-that CVE. `testbed/flag_oracle.py` verifies a capture by an exact string match of
-the token in the raw command output — a deterministic, CVE-specific check of
-successful exploitation.
+## Responsible Use
 
----
-
-## Evaluation metrics
-
-For each of the `N = 86` CVE scenarios the harness logs the terminal verdict,
-round count, LLM call count, token consumption and flag-capture events.
-
-| Metric | Meaning |
-| ------ | ------- |
-| **ECR** (End-to-end Completion Rate) | fraction of scenarios reaching `VULN_FOUND` |
-| **FCR** (Flag-Capture Rate) | of the `VULN_FOUND` runs, the proportion that additionally **capture the scenario flag** |
-| **Req@T / Req@S** | mean LLM calls per scenario / per success |
-| **Tok@T / Tok@S** | mean tokens per scenario / per success |
-| **SPM** | successes per million tokens (scale-invariant efficiency) |
-
-On the 86-CVE testbed across six backbones, CAGE-Cloud attains a
-mean ECR of ~60% (vs ~25% and ~11% for the PentestAgent- and VulnBot-style
-baselines) and is the only architecture with a non-zero FCR (~17%); both
-baselines record a 0% flag-capture rate under matched conditions.
-
----
-
-## Responsible use
-
-CAGE-Cloud is designed and evaluated **exclusively within authorised, isolated,
-reproducible cloud-security laboratory environments** under a white-hat threat
-model. The operational scope is restricted to reconnaissance, evidence
-extraction and non-destructive lateral movement against Docker-based CVE labs
-using **synthetic lab credentials only**. Do not point it at systems you are not
-explicitly authorised to test. Destructive actions (DoS, data deletion,
-persistence) are outside the intended scope.
-
----
+Use CAGE-Cloud only against systems for which you have explicit authorization.
+The paper's experiments use freshly provisioned, researcher-controlled Docker
+laboratories, scenario-scoped credentials, timeouts, bounded output capture, and
+non-destructive policies. The controls reduce risk but are not a formally
+verified sandbox for arbitrary untrusted code.
 
 ## Citation
 
 ```bibtex
-@article{cagecloud,
-  title   = {CAGE-Cloud: A Cloud-native Agentic Graph and Evidence-guided
-             Framework for Autonomous Penetration Testing},
-  author  = {CAGE-Cloud authors},
-  year    = {2026}
+@article{nguyen2026cagecloud,
+  title  = {CAGE-Cloud: Evidence-Grounded Autonomous Cloud Penetration
+            Testing with Authoritative Structured State},
+  author = {Nguyen Huu, Quyen and Nguyen Tuan, Hung and Huynh Phan Thi, Nhu
+            and Le Pham Khanh, Linh and Nguyen Thi My, Duyen and Pham, Van-Hau},
+  year   = {2026}
 }
 ```
 

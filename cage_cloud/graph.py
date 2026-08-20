@@ -13,6 +13,7 @@ Replaces MVP graph_lite.py with a full in-memory graph store featuring:
 from __future__ import annotations
 
 import json
+import hashlib
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -92,6 +93,77 @@ def _safe_text(value: Any) -> str:
         return ""
     text = str(value).strip()
     return text if text else ""
+
+
+def _canonical_key(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in ("id", "vuln_id", "cve_id", "name", "command", "resource_id"):
+            if value.get(key):
+                return f"{key}:{str(value[key]).strip().lower()}"
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return str(value).strip().lower()
+
+
+def _credential_signature(key: str, value: Any) -> str:
+    text = str(value).strip()
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    return f"{key.lower()}:{digest}"
+
+
+def progress_signature(state: Dict[str, Any]) -> Tuple[Tuple[str, ...], ...]:
+    """Build the canonical committed-progress signature from paper Eq. 24."""
+    verifications = [
+        item
+        for item in state.get("objective_verifications", []) or []
+        if isinstance(item, dict) and item.get("status") == "verified"
+    ]
+    verified_findings = {
+        str(evidence_id)
+        for item in verifications
+        for evidence_id in item.get("supporting_evidence_ids", []) or []
+    }
+    usable_credentials = {
+        _credential_signature(str(key), value)
+        for key, value in (state.get("credentials_found", {}) or {}).items()
+        if value not in (None, "")
+    }
+    dead_credentials = {
+        _credential_signature(str(key), value)
+        for item in state.get("dead_credentials", []) or []
+        if isinstance(item, dict)
+        for key, value in item.items()
+        if value not in (None, "")
+    }
+    usable_credentials.difference_update(dead_credentials)
+
+    validated_cves = {_canonical_key(item) for item in state.get("cve_success", []) or []}
+    if any(item.get("objective_type") == "cve_applicability_validated" for item in verifications):
+        validated_cves.update(
+            _canonical_key(item) for item in state.get("cve_candidates", []) or []
+        )
+
+    effects: set[str] = set()
+    if any(item.get("objective_type") == "exploit_effect_confirmed" for item in verifications):
+        effects.update(
+            _canonical_key(item) for item in state.get("exploits_successful", []) or []
+        )
+
+    resources = {
+        f"{kind}:{_canonical_key(item)}"
+        for kind, values in (state.get("cloud_artifacts", {}) or {}).items()
+        if isinstance(values, list)
+        for item in values
+    }
+    return tuple(
+        tuple(sorted(group))
+        for group in (
+            verified_findings,
+            usable_credentials,
+            validated_cves,
+            effects,
+            resources,
+        )
+    )
 
 
 @dataclass
@@ -279,16 +351,13 @@ class GraphState:
         for ep in state.get("web_endpoints", []) or []:
             ep_label = _safe_text(ep)
             if ep_label:
-                ep_id = self.add_node(_nid(NODE_TYPE_ENDPOINT, ep_label), NODE_TYPE_ENDPOINT, ep_label)
+                ep_id = self.add_node(
+                    _nid(NODE_TYPE_ENDPOINT, ep_label),
+                    NODE_TYPE_ENDPOINT,
+                    ep_label,
+                    {"status": "observed"},
+                )
                 self.add_edge(target_id, EDGE_TYPE_HAS_ENDPOINT, ep_id)
-
-                if "/proxy" in ep_label.lower():
-                    ssrf_id = self.add_node(
-                        _nid(NODE_TYPE_ATTACK_SURFACE, "ssrf_pivot"),
-                        NODE_TYPE_ATTACK_SURFACE,
-                        "ssrf_pivot",
-                    )
-                    self.add_edge(ep_id, EDGE_TYPE_SUGGESTS, ssrf_id)
 
         # Credential keys (names only, no values)
         for key in (state.get("credentials_found", {}) or {}).keys():
@@ -305,7 +374,12 @@ class GraphState:
         for cve in state.get("cve_candidates", []) or []:
             cve_label = _safe_text(cve)
             if cve_label:
-                cve_id = self.add_node(_nid(NODE_TYPE_CVE_CANDIDATE, cve_label), NODE_TYPE_CVE_CANDIDATE, cve_label)
+                cve_id = self.add_node(
+                    _nid(NODE_TYPE_CVE_CANDIDATE, cve_label),
+                    NODE_TYPE_CVE_CANDIDATE,
+                    cve_label,
+                    {"status": "candidate"},
+                )
                 self.add_edge(target_id, EDGE_TYPE_SUGGESTS, cve_id)
 
         # Vulnerabilities
@@ -322,6 +396,7 @@ class GraphState:
                     _nid(NODE_TYPE_VULNERABILITY, vuln_label),
                     NODE_TYPE_VULNERABILITY,
                     vuln_label,
+                    {"status": "verified"},
                 )
                 self.add_edge(target_id, EDGE_TYPE_HAS_VULNERABILITY, vuln_id)
 

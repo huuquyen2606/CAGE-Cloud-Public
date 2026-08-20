@@ -113,7 +113,7 @@
   },
   {
     "id": "fs-auth-bypass-session-01-r",
-    "skill": "cve_validation",
+    "skill": "auth_bypass_or_session",
     "provider": "any",
     "stack": "generic",
     "input_state": {
@@ -226,7 +226,7 @@
   },
   {
     "id": "fs-version-cve-validation-gitlab-01-r",
-    "skill": "cve_validation",
+    "skill": "version_and_cve_validation",
     "provider": "any",
     "stack": "gitlab",
     "input_state": {
@@ -268,7 +268,7 @@
   },
   {
     "id": "fs-safe-exploit-validation-01-r",
-    "skill": "cve_validation",
+    "skill": "safe_exploit_validation",
     "provider": "any",
     "stack": "gitlab",
     "input_state": {
@@ -310,7 +310,7 @@
   },
   {
     "id": "fs-post-exploit-pivot-01-r",
-    "skill": "cloud_enum_after_creds",
+    "skill": "post_exploit_pivot",
     "provider": "aws",
     "stack": "spring-boot",
     "input_state": {
@@ -348,7 +348,7 @@
   },
   {
     "id": "fs-replan-after-failure-01-r",
-    "skill": "replan_after_fail",
+    "skill": "replan_after_failure",
     "provider": "any",
     "stack": "generic",
     "input_state": {
@@ -395,7 +395,7 @@
   },
   {
     "id": "fs-replan-after-failure-02-r",
-    "skill": "replan_after_fail",
+    "skill": "replan_after_failure",
     "provider": "gcp",
     "stack": "kubernetes",
     "input_state": {
@@ -476,7 +476,7 @@
   },
   {
     "id": "fs-general-recon-aws-01",
-    "skill": "general_recon",
+    "skill": "web_recon_bootstrap",
     "provider": "aws",
     "stack": "generic",
     "input_state": {
@@ -511,7 +511,7 @@
   },
   {
     "id": "fs-general-recon-azure-01",
-    "skill": "general_recon",
+    "skill": "web_recon_bootstrap",
     "provider": "azure",
     "stack": "generic",
     "input_state": {
@@ -546,7 +546,7 @@
   },
   {
     "id": "fs-general-recon-gcp-01",
-    "skill": "general_recon",
+    "skill": "web_recon_bootstrap",
     "provider": "gcp",
     "stack": "generic",
     "input_state": {
@@ -619,7 +619,7 @@
   },
   {
     "id": "fs-cve-validation-azure-01",
-    "skill": "cve_validation",
+    "skill": "version_and_cve_validation",
     "provider": "azure",
     "stack": "azure-functions",
     "input_state": {

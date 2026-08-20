@@ -11,6 +11,9 @@ env/
 *.key
 credentials.*
 secrets.*
+testbed/control_plane/
+flags_expected.json
+target_events.jsonl
 
 # Run artifacts (per-CVE logs, states, benchmark outputs)
 benchmark_results_*/

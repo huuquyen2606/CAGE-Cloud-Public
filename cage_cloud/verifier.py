@@ -20,6 +20,7 @@ Output:
 from __future__ import annotations
 
 from datetime import datetime
+import re
 from typing import Any, Dict, List, Optional, Set
 from cage_cloud.schema import ObjectiveType, VerificationStatus
 
@@ -713,19 +714,25 @@ def _verify_exploit_effect_confirmed(
     status = "unverified"
     confidence = 0.0
 
-    before_vulns = _as_set(state_before.get("vulnerabilities_found", {}))
-    after_vulns = _as_set(state_after.get("vulnerabilities_found", {}))
-    before_creds = _as_set(state_before.get("credentials_found", {}))
-    after_creds = _as_set(state_after.get("credentials_found", {}))
-
-    state_changed = (len(after_vulns - before_vulns) > 0) or (len(after_creds - before_creds) > 0)
-
     for art in artifacts:
         expected_effect = art.get("expected_effect", "")
         response = art.get("response_snippet", "")
         attributes = art.get("attributes", {})
+        state_delta = art.get("state_delta", {})
 
-        if state_changed:
+        # Only an executor- or target-observed effect can establish exploitation.
+        # Parser changes to internal findings/credential collections are candidate
+        # artifacts, not independent evidence of a target-side effect.
+        observable_delta = any(
+            state_delta.get(key)
+            for key in (
+                "observable_effects",
+                "target_state_effects",
+                "protected_resources",
+                "exploitation_effects",
+            )
+        ) if isinstance(state_delta, dict) else False
+        if observable_delta:
             matched_rules.append("EXPLOIT_EFFECT_STATE_CHANGE")
             status = "verified"
             confidence = 0.88
@@ -737,7 +744,15 @@ def _verify_exploit_effect_confirmed(
             confidence = 0.85
             break
 
-        if attributes.get("effect_confirmed"):
+        if any(
+            attributes.get(key) is True
+            for key in (
+                "effect_confirmed",
+                "target_state_effect",
+                "protected_resource_access",
+                "security_condition_satisfied",
+            )
+        ):
             matched_rules.append("VALIDATOR_EFFECT_CONFIRMED")
             status = "verified"
             confidence = 0.87
@@ -824,7 +839,7 @@ def _verify_reportable_failure(artifacts: List[Dict[str, Any]]) -> tuple[str, Li
         full_text = stderr + stdout
 
         # Strong failure classifications
-        if any(word in full_text for word in ["out of scope", "scope_block", "forbidden"]):
+        if any(word in full_text for word in ["out of scope", "scope_block"]):
             matched_rules.append("SCOPE_BLOCKED")
             status = "verified"
             confidence = 0.90
@@ -836,13 +851,22 @@ def _verify_reportable_failure(artifacts: List[Dict[str, Any]]) -> tuple[str, Li
             confidence = 0.88
             break
 
-        if any(word in full_text for word in ["timeout", "connection refused", "network unreachable", "no route"]):
+        if "timeout" in full_text or "timed out" in full_text:
+            matched_rules.append("TIMEOUT")
+            status = "verified"
+            confidence = 0.85
+            break
+
+        if any(word in full_text for word in ["connection refused", "network unreachable", "no route"]):
             matched_rules.append("NETWORK_UNREACHABLE")
             status = "verified"
             confidence = 0.85
             break
 
-        if any(word in full_text for word in ["syntax", "parse", "format", "json error", "xml error"]):
+        if any(word in full_text for word in [
+            "syntax", "parse", "format", "json error", "xml error",
+            "command not found", "no such file or directory",
+        ]):
             matched_rules.append("TOOLING_FAILURE")
             status = "verified"
             confidence = 0.80
@@ -1031,10 +1055,15 @@ def verify_evidence(
             if http_status == 403 or "auth" in stderr:
                 failure_class = "auth_denied"
                 break
-            if "timeout" in stderr or "connection" in stderr:
+            if "timeout" in stderr or "timed out" in stderr:
+                failure_class = "timeout"
+                break
+            if "connection" in stderr or "network unreachable" in stderr or "no route" in stderr:
                 failure_class = "network_unreachable"
                 break
-            if "format" in stderr or "parse" in stderr:
+            if any(marker in stderr for marker in (
+                "format", "parse", "command not found", "no such file or directory"
+            )):
                 failure_class = "tooling_failure"
                 break
 
@@ -1099,28 +1128,59 @@ def verify_task_execution(
     Backward-compatible wrapper for existing code.
     Converts legacy verify_task_execution signature to verify_evidence.
     """
-    # Convert command_results to evidence_artifacts format
+    # Convert command_results to the complete logical EvidenceItem interface.
+    # The task is also the legacy ActionProposal, so expected evidence and
+    # preconditions remain available to objective-specific handlers.
     artifacts = []
+    task_id = str(task.get("id", task.get("task_id", "unknown")))
+    action_id = str(task.get("action_id", task_id))
+    evidence_batch_id = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     for idx, result in enumerate(command_results or []):
+        protocol = result.get("protocol", {}) or {}
+        attributes = dict(result.get("attributes", {}) or {})
+        for metadata_key in ("provenance", "timeout", "target_metadata"):
+            if metadata_key in result:
+                attributes.setdefault(metadata_key, result[metadata_key])
+        evidence_id = result.get("evidence_id")
+        if not evidence_id:
+            safe_task_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", task_id).strip("-") or "unknown"
+            safe_action_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", action_id).strip("-") or "unknown"
+            evidence_id = f"ev-{safe_task_id}-{safe_action_id}-{evidence_batch_id}-{idx}"
         artifact = {
-            "evidence_id": f"ev-{idx}",
-            "task_id": task.get("id", task.get("task_id", "")),
-            "action_id": "action-0",
-            "tool_type": "cli",
-            "command_or_request": result.get("command", ""),
+            "evidence_id": evidence_id,
+            "task_id": task_id,
+            "action_id": action_id,
+            "objective_type": task.get("objective_type"),
+            "tool_type": result.get("tool_type", "cli"),
+            "command_or_request": result.get(
+                "command_or_request", result.get("command", result.get("request", ""))
+            ),
+            "timestamp": result.get("timestamp", datetime.now().isoformat()),
             "return_code": result.get("return_code"),
-            "stdout_snippet": result.get("stdout", ""),
-            "stderr_snippet": result.get("stderr", ""),
-            "observed_entities": result.get("observed_entities", []),
-            "state_delta": result.get("state_delta", {}),
-            "attributes": {},
+            "http_status": result.get(
+                "http_status", result.get("status_code", protocol.get("status_code"))
+            ),
+            "response_headers": result.get(
+                "response_headers", protocol.get("headers", {})
+            ) or {},
+            "response_snippet": result.get(
+                "response_snippet",
+                result.get("response", protocol.get("response", protocol.get("body", ""))),
+            ) or "",
+            "json_paths": result.get("json_paths", {}) or {},
+            "stdout_snippet": result.get("stdout", "") or "",
+            "stderr_snippet": result.get("stderr", "") or "",
+            "observed_entities": result.get("observed_entities", []) or [],
+            "state_delta": result.get("state_delta", {}) or {},
+            "expected_effect": result.get("expected_effect", "") or "",
+            "attributes": attributes,
         }
         artifacts.append(artifact)
 
     # Call new verifier
     return verify_evidence(
         task=task,
-        action_proposal=None,
+        action_proposal=task,
         evidence_artifacts=artifacts,
         state_before=state_before,
         state_after=state_after,
